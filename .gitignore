@@ -43,6 +43,7 @@ loras/
 loras_i2v/
 
 settings/
+venv/
 
 wgp_config.json
 plugins_local.json
