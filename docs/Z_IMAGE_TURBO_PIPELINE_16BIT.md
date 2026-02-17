@@ -58,6 +58,53 @@ Dokument opisuje **ceo pipeline** Z Image Turbo u aplikaciji: od učitavanja mod
 
 ---
 
+### 3.1.1 Kako dodati custom checkpoint za Z-Image
+
+Modeli se definišu u JSON fajlovima iz `defaults/` i `finetunes/`. Checkpoint se traži u **checkpoints paths** (npr. `ckpts`, `.` – podešava se u Configuration → Checkpoints paths).
+
+**Način 1: Novi model preko `finetunes/` (preporučeno)**
+
+1. Kreiraj JSON u `finetunes/`, npr. `finetunes/my_z_image.json`:
+
+```json
+{
+  "model": {
+    "name": "Moj Z-Image checkpoint",
+    "architecture": "z_image",
+    "description": "Custom Z-Image Turbo checkpoint.",
+    "URLs": ["MojZImage_bf16.safetensors"]
+  },
+  "resolution": "1024x1024",
+  "batch_size": 1,
+  "num_inference_steps": 8,
+  "guidance_scale": 0
+}
+```
+
+2. Stavi `MojZImage_bf16.safetensors` u neki od checkpoints path-ova (npr. u `ckpts/`).
+3. U `wgp_config.json` u listu `"transformer_types"` dodaj ID modela – **ime fajla bez .json**:  
+   `"transformer_types": [ "z_image", "my_z_image" ]` (ili kako god da se zove tvoj JSON).
+
+`architecture` može biti i `z_image_base`, `z_image_control`, `z_image_control2`, `z_image_control2_1` – zavisi od tipa checkpointa. Za control varijante vidi `defaults/z_image_control2.json` (tamo je `"URLs": "z_image"` za bazu + `modules` za control modul).
+
+**Način 2: Lokalni fajl preko `source`**
+
+Ako želiš da se učitava **samo jedan lokalni fajl** (bez liste URL-ova), u definiciji modela stavi:
+
+```json
+"model": {
+  "name": "Z-Image iz lokalnog fajla",
+  "architecture": "z_image",
+  "source": "put/do/MojCheckpoint_bf16.safetensors"
+}
+```
+
+`source` može biti samo ime fajla (npr. `MojCheckpoint_bf16.safetensors`) – tada se fajl traži u checkpoints path-ovima – ili relativan put unutar tih path-ova. U `z_image_main.py` učitavanje ide preko `fl.locate_file(source)` (linije 103–105).
+
+**Napomena:** VAE, scheduler i text encoder (Qwen3) i dalje dolaze iz zajedničkih fajlova (ZImageTurbo_VAE_bf16.safetensors, ZImageTurbo_scheduler_config.json, Qwen3/…). Samo **transformer** (diffusion model) menjaš svojim checkpointom.
+
+---
+
 ### 3.2 Učitavanje modela (16-bit)
 
 Poziv iz glavne app (npr. `wgp.py`) ide preko:
