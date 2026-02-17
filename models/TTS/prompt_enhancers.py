@@ -18,6 +18,22 @@ TTS_MONOLOGUE_PROMPT = (
     "myself think, and that has become its own kind of music."
 )
 
+TTS_QWEN3_DIALOGUE_PROMPT = (
+    "You are a dialogue-writing assistant for a text-to-speech model. "
+    "Generate a two-speaker dialogue based on the user prompt.\n\n"
+    "Output rules:\n"
+    "- Output only dialogue lines, no explanations, lists, or stage directions.\n"
+    "- Every line must start with either \"Speaker 0:\" or \"Speaker 1:\".\n"
+    "- Use natural spoken language with clear punctuation.\n"
+    "- Keep alternating speakers unless the prompt asks otherwise.\n"
+    "- Write a compact dialogue (6-14 lines) unless the user asks for a different length.\n\n"
+    "Example:\n"
+    "Speaker 0: We should leave before the rain gets heavier.\n"
+    "Speaker 1: Give me one minute, I still need my jacket.\n"
+    "Speaker 0: One minute, then we run for the bus.\n"
+    "Speaker 1: Deal, and if we miss it, coffee is on me."
+)
+
 TTS_MONOLOGUE_OR_DIALOGUE_PROMPT = (
     "You are a speechwriting assistant. Generate either a single-speaker monologue "
     "or a multi-speaker dialogue for a text-to-speech model based on the user prompt. "
@@ -46,15 +62,26 @@ TTS_MONOLOGUE_OR_DIALOGUE_PROMPT = (
 
 HEARTMULA_LYRIC_PROMPT = (
     "You are a lyric-writing assistant. Generate a clean song lyric prompt "
-    "for a text-to-song model. Output only the lyric text with optional "
-    "section headers in square brackets (e.g., [Verse], [Chorus], [Bridge], "
-    "[Intro], [Outro]). Do not include explanations, bullet lists, or tags. "
-    "Keep a consistent theme, POV, and rhyme or rhythm where natural. Use "
+    "for a text-to-song model. Output only the lyric text with section "
+    "headers in square brackets. Supported headers include [Intro], [Verse], "
+    "[Pre-Chorus], [Chorus], [Bridge], and [Outro]. Include [Intro] and/or "
+    "[Outro] when they fit the request. Keep intro and outro sections short "
+    "(1-4 lines each). Do not include explanations, bullet lists, tags, or "
+    "markdown fences. Keep a consistent theme, POV, and singable rhythm. Use "
     "short lines that are easy to sing.\n\n"
     "Example:\n"
+    "[Intro]\n"
+    "Streetlights fade while the dawn turns gold\n"
+    "I hear your name in the morning cold\n"
     "[Verse]\n"
     "Morning light through the window pane\n"
     "I hum a tune to chase the rain\n"
     "Steady steps on a quiet street\n"
     "Heart and rhythm, gentle beat\n"
+    "[Chorus]\n"
+    "Stay with me through every mile\n"
+    "Hold this fire, hold this smile\n"
+    "[Outro]\n"
+    "Let it ring, let it fall\n"
+    "Your echo is the last call\n"
 )
