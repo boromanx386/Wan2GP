@@ -33,6 +33,38 @@ WanGP supports the Wan (and derived models) but also Hunyuan Video, Flux, Qwen, 
 
 
 ## 🔥 Latest Updates : 
+### February 19th 2026: WanGP v10.951, Breaking the Sound Barrier, Mach 2
+Here comes the (last ?) missing bit in WanGP of the *Text To Speech* offering: **emotions**
+
+There isnt many TTS models around that let you express emotions, so I hope you will forgive me for adding an old TTS model (6 months old!) in WanGP: **Index TTS 2**.
+
+But in WanGP, you wont just get the vanilla version of Index TTS:
+- *Two speakers Dialogue* (with 2 Cloned Voices) out of the Box
+- Each speaker can express *varrying emotions* within the same prompt   
+- *Volume Normalization* of the two speaker voices (no one will speak louder)
+- Optimized for a *dialogue that can last forever* (new *infinitalk* best friend)
+- *GPU Poor version*: VRAM, 6GB will be sufficient
+- Highly Optimized with *vllm* & *Cuda Graph acceleration*: *up to 10x faster* than vanilla Index TTS. On high end GPUs, generating a 1 min of dialogue will take only 30s !
+
+Here is how to use it: By default Index TTS, will detect automatically the emotion to apply to a Text Prompt based on the text itself. However, it will apply the same emotion for the whole prompt. If you want a different emotion per sentence, just insert empty lines between each sentence.
+
+You can also set manually which emotion you expect with [] tags, here is one example for one speaker:
+```bash
+[fear] At the very beginning I was so afraid to speak.
+[sadness] Nobody would talk to me. I felt so alone.
+[disgust] They would just ignore me and pretend that I didnt exist
+[happy] By chance I discovered this wonderful App, and now everything is different.
+[anger] I have a new voice and now everybody will have no choice but to listen to my words !!! 
+```
+You can mix emotions *[sadness,disgust]* or if you want to precise the weight of one or several emotions *[sadness=0.7,disgust]* (in any case total of weights is 1)
+
+Remember two speakers mode requires to insert *"Speaker 1:"* & *"Speaker 2:"* to indicate who is talking.
+
+There is only one snag: Index TTS 2 supports only English & Chinese. But dont' panic ! not all is lost. There is a workaround:
+1) Feed *Index TTS 2* with the voice to clone and ask it to generate a sample English spoken text with with the emotion you expected
+2) Now ask *Qwen3TTS*, to clone this newly generated voice sample (in English) in the other language you want
+
+
 ### February 16th 2026: WanGP v10.9, Breaking the Sound Barrier
 With this new release of WanGP you should have the best TTS (Text To Speech) experience you can find:
 
