@@ -33,6 +33,51 @@ WanGP supports the Wan (and derived models) but also Hunyuan Video, Flux, Qwen, 
 
 
 ## 🔥 Latest Updates : 
+### March 10th 2026: WanGP v10.987, Prompt Enhancer has just Been Abliterated
+
+- **Qwen3.5 VL Abliterated Prompt Enhancer**: new choice of Prompt Enhancer
+   * Based on widely acclaimed *Qwen3.5 model* that has just been released
+   * *Uncensored* thanks to the *Abliterating* process that nullifies any *LLM will* to decline any of your request
+   * 4 choices of models: depending on how much VRAM you have *4B & 9B models*, and *GGUF Q4* or *Int8*
+   * *vllm accelerated* x5 faster, if Flash Attention 2 & Triton are installed (please check docs/INSTALLATION.md) 
+   
+- **GGUF CUDA Kernels**: 15% speed gain when using GGUF on Diffusion Video Models & x3 speed with GGUF LLM (*Qwen 3.5 VL GGUF* for instance). GGUF Kernels are for the moment only available for Windows (please check docs/INSTALLATION.md).
+
+- **LTX2.3 Improvements**
+   * *End Frame without Start Frame*: you know how your story ends but want to see how it started, just give an End Frame (no start Frame) 
+   *  New GGUF Checkpoints
+   *  VAE Decoding hopefully should expose less banding
+
+- **WanGP API**: rejoice developers (or agents) among you ! WanGP offers now an internal API that allows you to use WanGP as a backend for your apps. It is subject to compliance to the terms & conditions of WanGP license and more specifically to inform the users of your app that WanGP is working behind the scene.
+
+- **LTX Desktop WanGP**: as a sample app (made just for fun) that uses WanGP API, you may try LTX Desktop. This app offers Video / Audio nice editing capabilities but will require 32+ VRAM to run. As now it uses WanGP as its core engine, VRAM requirements are much smaller. It will use LTX 2.3 for Video Gen & Z Image turbo fo Image gen. You can reuse (in theory) your current WanGP install with *LTX Destop WanGP*. https://github.com/deepbeepmeep/LTX-Desktop-WanGP
+
+- **New Audio Ouput formats in mp4**: audio stored in video file can now be of higher quality (*AAC192 - AAC320*) or *ALAC* (lossless). Please note that you wont be able listen to ALAC audio track directly in the webapp.
+
+Also note as people preferred mataynone v1 over v2 I have added an option to select matanyone version in the Config / Extension tab
+
+### March 7th 2026: WanGP v10.981, Expecting an Update ? 
+
+- **LTX-2 2.3**: 0 day delivery of LTX 2 latest version with better *audio*, *image 2 video* and *greater details*. This model is bigger (22B versus 19B), but with WanGP VRAM usage will be still ridiculously low. Try it at 720p or 1080p, this is where it will shine the most !
+
+*Control Video Support* (*Ic lora Union Control*) will let you transfer *Human Motion*, *Edges*, ... in your new video.
+
+For expert users, *Dev* finetune offers extra new configurable settings (*modality guidance*, *audio guidance*, *STG pertubation/skip self attention *, *guidance rescaling*). LTX team suggests: Cfg=3, Audio cfg=7, Modality Cfg=3, Rescale=0.7, STG Perturbation Skip Attention on all steps.
+
+I recommend to stick to the *Distilled* finetune for higher resolutions (see sample video below) as it seems to have been distilled from a higher quality model (pro model?).
+
+- **Kiwi Edit**: a great model that lets you edit video and / or inject objects in a video. It exists in 3 flavours depending on what you want to do
+
+- **SVI PRO2 End Frames**: this should allow in theory to generate very long shots by splitting one shot into sub shots (sliding windows) by inserting key frames (the *End Frames*). This is an alternative to the *Infinitalk* references frames method (see my old release notes). I am waiting for your feedback to know which method is the best one.
+
+- **Upgraded Models Selector** with *already Downloaded indicator*: Next to each model or finetune, you will find a colored square: *Blue* = fully downloaded & available, *Yellow* = partially downloaded & *Black* = not downloaded at all. Please note that the square color will depend on your current choices of requested model quantization.
+
+- **Upgraded Models Manager**: colors squares have also been added so that you can see in glance what has already been downloaded. New filter for a quick model lookout. List of missing files per finetune.
+
+- **Matanyone 2**: everyone favorite Mask extractor has been been updated and is now more precise
+
+*update 10.981*: LTX2.3 Ic Lora Support & expert settings, Matanyone 2, SVI Pro end frames
+
 ### February 19th 2026: WanGP v10.951, Breaking the Sound Barrier, Mach 2
 Here comes the (last ?) missing bit in WanGP of the *Text To Speech* offering: **emotions**
 
@@ -146,7 +191,7 @@ Once we are all there it will be much easier to provide precompiled kernels for 
 So please follow the *manual upgrade instructions below* (no Pinokio auto upgrade for the moment) and let me know on Discord if it works with all generations of GPUs (starting from GTX10xx to RTX50xx).
 You will find the kernels for this new setup in the **guides/INSTALLATION.md**.
 
-- **Wan Motion Self Refiner**: You will have to thank **Steve Jabz** (*Tophness*) for this one as he has been a big sponsor of the *Self Refiner* and did some extensive study to show me its beauty. The *Self Refiner* should improve the quality of the motion (find it in the *Quality Tab*). It relies on a *Refiner Plan* which indicate which steps should be refined for instance: "2-5:3" (default plan suits well for *light2xv* 4 steps) means steps 2-3 will be refined 3 times (that is 3 denoising attempts will be made to improve each of them, so if the self refiner is used the gen will be up to 3x slower). For the moment the *Self Refiner* is enabled only on Wan t2v & i2v. If you are happy with it, we will support more models.
+- **Wan Motion Self Refiner**: You will have to thank **Steve Jabz** (*Tophness*) for this one as he has been a big sponsor of the *Self Refiner* and did some extensive study to show me its beauty. The *Self Refiner* should improve the quality of the motion (find it in the *Quality Tab*). It relies on a *Refiner Plan* which indicate which steps should be refined for instance: "2-5:3" (default plan suits well for *lightx2v* 4 steps) means steps 2-3 will be refined 3 times (that is 3 denoising attempts will be made to improve each of them, so if the self refiner is used the gen will be up to 3x slower). For the moment the *Self Refiner* is enabled only on Wan t2v & i2v. If you are happy with it, we will support more models.
 
 
 **Note that PyTorch 2.10 represents at last a decent upgrade, no memory leak when switching models (pytorch 2.8) and bad perfs / VRAM peaks with VAE decoding (pytorch 2.9).**

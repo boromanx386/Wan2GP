@@ -107,7 +107,7 @@ ACE_STEP15_CUSTOM_SETTINGS = [
     },
     {
         "id": "language",
-        "label": "Language (ISO code, empty = auto/en)",
+        "label": "Language (ISO code, empty = auto/unknown)",
         "name": "Language",
         "type": "text",
         "default": "",
@@ -303,6 +303,7 @@ class family_handler:
                 "enabled_audio_lora": True,
                 "lm_engines": ["vllm"],
                 "prompt_class": "Lyrics",
+                "alt_guidance": "LM Guidance (CFG)",
                 "prompt_description": "Lyrics / Prompt (Write [Instrumental] for Instrumental Generation only)",
                 "audio_prompt_type_sources": {
                     "selection": ["", "A", "B", "AB"],
@@ -325,7 +326,7 @@ class family_handler:
                 "duration_slider": dict(ACE_STEP15_DURATION_SLIDER),
                 "custom_settings": [one.copy() for one in ACE_STEP15_CUSTOM_SETTINGS],
                 "text_prompt_enhancer_instructions": HEARTMULA_LYRIC_PROMPT,
-                "text_prompt_enhancer_max_tokens": 512,
+                "text_prompt_enhancer_max_tokens": 1024,
                 "prompt_enhancer_button_label": "Compose Lyrics",
             }
             if _ace_step15_has_lm_definition(model_def):
@@ -591,10 +592,11 @@ class family_handler:
                     "video_length": 0,
                     "num_inference_steps": 8,
                     "negative_prompt": "",
-                    "temperature": 1.0,
+                    "temperature": 0.85,
                     "top_p": 0.9,
                     "top_k": 0,
                     "guidance_scale": 1.0,
+                    "alt_guidance_scale": 2.5,
                     "multi_prompts_gen_type": 2,
                     "audio_scale": 0.5,
                 }
@@ -640,6 +642,8 @@ class family_handler:
             else:
                 ui_defaults.setdefault("top_p", 0.9)
                 ui_defaults.setdefault("top_k", 0)
+            if settings_version < 2.53:
+                ui_defaults["alt_guidance_scale"] = 2.5
             return
         if ui_defaults.get("sample_solver", "") in ("", None):
             legacy_scheduler = ui_defaults.get("scheduler_type", "")
