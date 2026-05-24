@@ -10,6 +10,13 @@ except Exception:  # pragma: no cover
     triton = None
     tl = None
 
+_USE_TRITON_RMSNORM = triton is not None and tl is not None
+
+
+def configure_layernorm_safe_legacy_kernels(enabled: bool) -> None:
+    global _USE_TRITON_RMSNORM
+    _USE_TRITON_RMSNORM = (not enabled) and triton is not None and tl is not None
+
 
 if triton is not None:
     @triton.jit
@@ -67,9 +74,10 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.use_triton_rmsnorm = _USE_TRITON_RMSNORM
 
     def _can_use_triton(self, x: torch.Tensor, residual: torch.Tensor | None = None) -> bool:
-        if triton is None or tl is None:
+        if not self.use_triton_rmsnorm or triton is None or tl is None:
             return False
         if not x.is_cuda or self.weight.device.type != "cuda":
             return False
@@ -86,7 +94,9 @@ class RMSNorm(nn.Module):
         orig_dtype = x.dtype
         x_float = x.float()
         var = x_float.pow(2).mean(dim=-1, keepdim=True)
-        return (x_float * torch.rsqrt(var + self.eps)).to(orig_dtype) * self.weight
+        normed = x_float * torch.rsqrt(var + self.eps)
+        normed *= self.weight
+        return normed.to(orig_dtype)
 
     def _fallback_add_rms_forward(
         self,
@@ -97,8 +107,9 @@ class RMSNorm(nn.Module):
         summed = x.float() + residual.float()
         residual_out = summed.to(orig_dtype)
         var = summed.pow(2).mean(dim=-1, keepdim=True)
-        normed = (summed * torch.rsqrt(var + self.eps)).to(orig_dtype) * self.weight
-        return normed, residual_out
+        normed = summed * torch.rsqrt(var + self.eps)
+        normed *= self.weight
+        return normed.to(orig_dtype), residual_out
 
     def _triton_rms_forward(self, x: torch.Tensor) -> torch.Tensor:
         x_2d = x.reshape(-1, x.shape[-1])

@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import sys
 import torch
 from importlib.metadata import version
 from mmgp import offload
@@ -6,8 +7,11 @@ import torch.nn.functional as F
 import warnings
 from importlib.metadata import version
 
-major, minor = torch.cuda.get_device_capability(None)
-bfloat16_supported =  major >= 8 
+_is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+
+major, minor = (0, 0) if _is_mps else torch.cuda.get_device_capability(None)
+bfloat16_supported =  major >= 8
+_MASKED_ATTENTION_SDPA_WARNED = False
 
 try:
     import triton
@@ -62,11 +66,12 @@ except ImportError:
             pass
 
 try:
-    from .sage2_core import sageattn as sageattn2, is_sage2_supported
+    from .sage2_core import sageattn as sageattn2, is_sage2_supported, sageattn_attention_mask_support_reason
     sage2_supported =  is_sage2_supported()
 except ImportError:
     sageattn2 = None
     sage2_supported = False
+    sageattn_attention_mask_support_reason = lambda *args, **kwargs: "SageAttention 2 is unavailable"
     if not triton_installed: 
         try:
             sg2_version = version("sageattention")
@@ -77,12 +82,27 @@ except ImportError:
 @torch.compiler.disable()
 def sageattn2_wrapper(
         qkv_list,
-        attention_length
+        attention_length,
+        recycle_q = False,
+        attention_mask = None,
     ):
     q,k, v = qkv_list
+    q_dtype = q.dtype
     qkv_list = [q,k,v]
     del q, k ,v
-    o = sageattn2(qkv_list, tensor_layout="NHD")
+    if attention_mask is not None:
+        if attention_mask.ndim == 4:
+            attention_mask = attention_mask.transpose(1, 2)
+        elif attention_mask.ndim == 3:
+            attention_mask = attention_mask.unsqueeze(1)
+        elif attention_mask.ndim == 2:
+            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+        if torch.is_floating_point(attention_mask):
+            attention_mask = attention_mask.to(dtype=q_dtype)
+        elif attention_mask.dtype == torch.bool:
+            has_keys = attention_mask.any(dim=-1, keepdim=True)
+            attention_mask = torch.where(has_keys, attention_mask, torch.ones_like(attention_mask))
+    o = sageattn2(qkv_list, tensor_layout="NHD", recycle_q=recycle_q, attn_mask=attention_mask)
     qkv_list.clear()
 
     return o
@@ -163,7 +183,8 @@ def sageattn3_wrapper(
 def sdpa_wrapper(
         qkv_list,
         attention_length,
-        attention_mask = None        
+        attention_mask = None,
+        causal = False,
     ):
     q, k, v = qkv_list
 
@@ -172,7 +193,7 @@ def sdpa_wrapper(
     v = v.transpose(1,2)
     if attention_mask != None:
         attention_mask = attention_mask.transpose(1,2)
-    o = F.scaled_dot_product_attention( q, k, v, attn_mask=attention_mask, is_causal=False).transpose(1,2)
+    o = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, is_causal=causal).transpose(1,2)
     del q, k ,v
     qkv_list.clear()
 
@@ -198,6 +219,9 @@ def get_attention_modes():
     return ret
 
 def get_supported_attention_modes():
+    # MPS compatibility: only SDPA is supported on Apple Silicon
+    if _is_mps:
+        return ["sdpa", "auto"]
     ret = get_attention_modes()
     major, minor = torch.cuda.get_device_capability()
     if  major < 10 or not triton_installed:
@@ -222,7 +246,9 @@ __all__ = [
 ]
 
 def get_cu_seqlens(batch_size, lens, max_len):
-    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device="cuda")
+    # MPS compatibility: use dynamic device detection
+    _cu_device = "mps" if _is_mps else "cuda"
+    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=_cu_device)
 
     for i in range(batch_size):
         s = lens[i] 
@@ -244,15 +270,30 @@ def pay_attention(
     version=None,
     force_attention= None,
     attention_mask = None,
-    cross_attn= False,
+    recycle_q = False,
     q_lens = None,
     k_lens = None,
 ):
+    global _MASKED_ATTENTION_SDPA_WARNED
     # format : torch.Size([batches, tokens, heads, head_features])
     # assume if q_lens is non null, each q is padded up to lq (one q out of two will need to be discarded or ignored)
     # assume if k_lens is non null, each k is padded up to lk (one k out of two will need to be discarded or ignored)
     if attention_mask != None:
-        force_attention = "sdpa"
+        requested_attn = offload.shared_state["_attention"] if force_attention == None else force_attention
+        requested_attn = "sage2" if requested_attn == "radial" else requested_attn
+        support_reason = None
+        if _is_mps:
+            support_reason = "MPS uses SDPA for masked attention"
+        elif requested_attn == "sage2" and sageattn2 != None and not causal and q_lens == None and k_lens == None:
+            support_reason = sageattn_attention_mask_support_reason(qkv_list, attention_mask, tensor_layout="NHD")
+        if requested_attn == "sage2" and support_reason is None and sageattn2 != None and not causal and q_lens == None and k_lens == None:
+            force_attention = "sage2"
+        else:
+            force_attention = "sdpa"
+            if requested_attn != "sdpa" and not _MASKED_ATTENTION_SDPA_WARNED:
+                detail = f" ({support_reason})" if support_reason else ""
+                print(f"[WAN2GP] Attention mask is unsupported by selected attention '{requested_attn}'{detail}. Masked attention will use SDPA.")
+                _MASKED_ATTENTION_SDPA_WARNED = True
         if  attention_mask.dtype == torch.bfloat16 and not bfloat16_supported:
             attention_mask = attention_mask.to(torch.float16)
     attn = offload.shared_state["_attention"] if force_attention== None else force_attention
@@ -272,6 +313,7 @@ def pay_attention(
     batch = len(q)
     if len(k) != batch: k = k.expand(batch, -1, -1, -1)
     if len(v) != batch: v = v.expand(batch, -1, -1, -1)
+    if q.device.type == "mps": q, k, v = q.contiguous(), k.contiguous(),v.contiguous()
     if attn == "chipmunk":
         from src.chipmunk.modules import SparseDiffMlp, SparseDiffAttn
         from src.chipmunk.util import LayerCounter, GLOBAL_CONFIG
@@ -339,11 +381,11 @@ def pay_attention(
             szq = q_lens[0].item() if q_lens != None else lq
             szk = k_lens[0].item() if k_lens != None else lk
             if szq != lq or szk != lk:
-                cu_seqlens_q = torch.tensor([0, szq, lq], dtype=torch.int32, device="cuda")
-                cu_seqlens_k = torch.tensor([0, szk, lk], dtype=torch.int32, device="cuda")
+                cu_seqlens_q = torch.tensor([0, szq, lq], dtype=torch.int32, device=q.device)
+                cu_seqlens_k = torch.tensor([0, szk, lk], dtype=torch.int32, device=q.device)
             else:
-                cu_seqlens_q = torch.tensor([0, lq], dtype=torch.int32, device="cuda")
-                cu_seqlens_k = torch.tensor([0, lk], dtype=torch.int32, device="cuda")
+                cu_seqlens_q = torch.tensor([0, lq], dtype=torch.int32, device=q.device)
+                cu_seqlens_k = torch.tensor([0, lk], dtype=torch.int32, device=q.device)
             q = q.squeeze(0)
             k = k.squeeze(0)
             v = v.squeeze(0)
@@ -361,81 +403,18 @@ def pay_attention(
             max_seqlen_kv=lk,
         ).unflatten(0, (b, lq))
     elif attn=="sage3":
-        import math
-        if cross_attn or True:
-            qkv_list = [q,k,v]
-            del q,k,v
-            x = sageattn3_wrapper(qkv_list, lq)
+        qkv_list = [q,k,v]
+        del q,k,v
+        x = sageattn3_wrapper(qkv_list, lq)
     elif attn=="sage2":
-        import math
-        if cross_attn or True:
-            qkv_list = [q,k,v]
-            del q,k,v
-
-            x = sageattn2_wrapper(qkv_list, lq) #.unsqueeze(0)
-        # else:
-        #     layer =  offload.shared_state["layer"]
-        #     embed_sizes = offload.shared_state["embed_sizes"] 
-        #     current_step = offload.shared_state["step_no"] 
-        #     max_steps = offload.shared_state["max_steps"]  
-
-
-        #     nb_latents =  embed_sizes[0] * embed_sizes[1]* embed_sizes[2]
-
-        #     window = 0
-        #     start_window_step = int(max_steps * 0.3)
-        #     start_layer = 10
-        #     end_layer = 30
-        #     if (layer < start_layer or layer > end_layer )  or current_step <start_window_step: 
-        #         window = 0
-        #     else:
-        #         # coef =  min((max_steps - current_step)/(max_steps-start_window_step),1)*max(min((25 - layer)/(25-start_layer),1),0) * 0.7 + 0.3
-        #         coef = 0.3
-        #         print(f"step: {current_step}, layer: {layer}, coef:{coef:0.1f}]")
-        #         window =  math.ceil(coef* nb_latents)
-
-        #     invert_spaces = (layer + current_step) % 2 == 0 and window > 0
-        #     invert_spaces = False
-        #     def flip(q):
-        #         q = q.reshape(*embed_sizes, *q.shape[-2:])
-        #         q = q.transpose(0,2)
-        #         q = q.contiguous()
-        #         q = q.transpose(0,2)
-        #         q = q.reshape( -1, *q.shape[-2:])
-        #         return q
-
-        #     def flop(q):
-        #         q = q.reshape(embed_sizes[2], embed_sizes[1], embed_sizes[0] , *q.shape[-2:])
-        #         q = q.transpose(0,2)
-        #         q = q.contiguous()
-        #         q = q.transpose(0,2)
-        #         q = q.reshape( -1, *q.shape[-2:])
-        #         return q
-
-
-        #     if invert_spaces:
-
-        #         q = flip(q)
-        #         k = flip(k)
-        #         v = flip(v)            
-        #     qkv_list = [q,k,v]
-        #     del q,k,v
-
-
-
-        #     x = sageattn_window_wrapper(qkv_list, lq, window= window) #.unsqueeze(0)
-
-        #     if invert_spaces:
-        #         x = flop(x)
-        #     x = x.unsqueeze(0)
-
-        
+        qkv_list = [q,k,v]
+        del q,k,v
+        x = sageattn2_wrapper(qkv_list, lq, recycle_q=recycle_q, attention_mask=attention_mask)
     elif attn=="sdpa":
         qkv_list = [q, k, v]
         del q ,k ,v
-        x = sdpa_wrapper( qkv_list, lq, attention_mask = attention_mask) #.unsqueeze(0)
+        x = sdpa_wrapper(qkv_list, lq, attention_mask=attention_mask, causal=causal)
     elif attn=="flash" and version == 3:
-        # Note: dropout_p, window_size are not supported in FA3 now.
         x = flash_attn_interface.flash_attn_varlen_func(
             q=q,
             k=k,

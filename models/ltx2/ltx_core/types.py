@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import torch
@@ -157,6 +157,20 @@ class AudioLatentShape(NamedTuple):
 
 
 @dataclass(frozen=True)
+class TimestepCompressionPlan:
+    frame_mask: torch.Tensor | None = None
+    frame_indices: torch.Tensor | None = None
+
+
+@dataclass
+class LatentStateRuntimeCache:
+    timestep_plan: TimestepCompressionPlan | None = None
+    rope_caches: dict[tuple, object] = field(default_factory=dict)
+    base_timestep: torch.Tensor | None = None
+    prompt_base_timestep: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
 class LatentState:
     """
     State of latents during the diffusion denoising process.
@@ -165,12 +179,15 @@ class LatentState:
         denoise_mask: Mask encoding the denoising strength for each token (1 = full denoising, 0 = no denoising).
         positions: Positional indices for each latent element, used for positional embeddings.
         clean_latent: Initial state of the latent before denoising, may include conditioning latents.
+        attention_mask: Optional self-attention mask of shape (B, T, T). Values in [0, 1] where 1 = full attention.
     """
 
     latent: torch.Tensor
     denoise_mask: torch.Tensor
     positions: torch.Tensor
     clean_latent: torch.Tensor
+    attention_mask: torch.Tensor | None = None
+    runtime_cache: LatentStateRuntimeCache = field(default_factory=LatentStateRuntimeCache, compare=False, repr=False)
 
     def clone(self) -> "LatentState":
         return LatentState(
@@ -178,4 +195,5 @@ class LatentState:
             denoise_mask=self.denoise_mask.clone(),
             positions=self.positions.clone(),
             clean_latent=self.clean_latent.clone(),
+            attention_mask=self.attention_mask.clone() if self.attention_mask is not None else None,
         )
