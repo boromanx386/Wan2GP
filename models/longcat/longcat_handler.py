@@ -92,6 +92,7 @@ class family_handler:
                     "audio_guide2_label": "Voice to follow #2",
                     "audio_guidance": True,
                     "any_audio_prompt": True,
+                    "returns_audio": True,
                     "audio_prompt_choices": True,
                     "audio_prompt_type_sources": {
                         "selection": ["A", "XA", "CAB", "PAB"],
@@ -101,9 +102,9 @@ class family_handler:
                     },
                     "speaker_locations": True,
                     "image_ref_choices": {
-                        "choices": [("None", ""), ("Anchor Reference Image", "KI")],
+                        "choices": [ ("Anchor Reference Image", "KI")],
                         "letters_filter": "KI",
-                        "visible": True,
+                        "visible": False,
                         "label": "Anchor Reference Image",
                     },
                     "reference_image_enabled": True,
@@ -129,6 +130,11 @@ class family_handler:
 
 
         return extra_model_def
+
+    @staticmethod
+    def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
+        if base_model_type in LONGCAT_AVATAR_TYPES:
+            ui_defaults["video_prompt_type"] = "KI"
 
     @staticmethod
     def get_rgb_factors(base_model_type):
