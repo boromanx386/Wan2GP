@@ -35,6 +35,7 @@ class family_handler:
             "image_outputs": True,
             "flux2": True,
             "pid_upsampler": [1],
+            "pid_vae_backbone": "flux2",
             "guidance_max_phases": 0,
             "inference_steps": False,
             "lock_inference_steps": True,
@@ -46,6 +47,7 @@ class family_handler:
             "vae_block_size": 16,
             "prompt_enhancer_button_label": "Magic Prompt",
             "prompt_infos": IDEOGRAM4_PROMPT_INFOS,
+            "prompt_helper_popup_dims": [78, 100],
             "prompt_enhancer_def": {
                 "selection": ["T"],
                 "labels": {"T": "Ideogram JSON caption from Text Prompt"},
@@ -82,6 +84,24 @@ class family_handler:
     @staticmethod
     def query_family_infos():
         return {"ideogram4": (140, "Ideogram")}
+
+    @staticmethod
+    def render_prompt_helper(model_type, model_def, prompt_id, popup_id, prompt_elem_id, resolution_elem_id):
+        from .prompt_helper import render_prompt_helper
+
+        return render_prompt_helper(model_type, model_def, prompt_id, popup_id, prompt_elem_id, resolution_elem_id)
+
+    @staticmethod
+    def get_prompt_helper_css():
+        from .prompt_helper import get_prompt_helper_css
+
+        return get_prompt_helper_css()
+
+    @staticmethod
+    def get_prompt_helper_javascript():
+        from .prompt_helper import get_prompt_helper_javascript
+
+        return get_prompt_helper_javascript()
 
     @staticmethod
     def get_rgb_factors(base_model_type):

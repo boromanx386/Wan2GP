@@ -198,12 +198,10 @@ class Ideogram4WanPipeline:
         return self.autoencoder.decoder(z.to(vae_dtype)).float().clamp(-1.0, 1.0)
 
     def _decode(self, z: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
-        return self._decode_image(z, grid_h, grid_w).unsqueeze(1).cpu()
+        return self._decode_image(z, grid_h, grid_w).cpu().transpose(0, 1)
 
     def _unpack_vae_latents(self, z: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
-        latent_shift = self.latent_shift.to(z.device, z.dtype)
-        latent_scale = self.latent_scale.to(z.device, z.dtype)
-        z = z * latent_scale + latent_shift
+        z = self._normalize_packed_latents(z)
         batch_size = z.shape[0]
         patch = self.patch_size
         ae_channels = z.shape[-1] // (patch * patch)
@@ -211,8 +209,21 @@ class Ideogram4WanPipeline:
         z = z.permute(0, 5, 1, 3, 2, 4).contiguous()
         return z.view(batch_size, ae_channels, grid_h * patch, grid_w * patch)
 
+    def _normalize_packed_latents(self, z: torch.Tensor) -> torch.Tensor:
+        latent_shift = self.latent_shift.to(z.device, z.dtype)
+        latent_scale = self.latent_scale.to(z.device, z.dtype)
+        return z * latent_scale + latent_shift
+
     def _pack_pid_lq_latent(self, z: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
-        return z.view(z.shape[0], grid_h, grid_w, z.shape[-1]).permute(0, 3, 1, 2).contiguous()
+        z = self._normalize_packed_latents(z)
+        batch_size = z.shape[0]
+        patch = self.patch_size
+        ae_channels = z.shape[-1] // (patch * patch)
+        z = z.view(batch_size, grid_h, grid_w, patch, patch, ae_channels).permute(0, 5, 3, 4, 1, 2).contiguous()
+        z = z.view(batch_size, ae_channels * patch * patch, grid_h, grid_w)
+        vae_mean = self.autoencoder.bn.running_mean.view(1, -1, 1, 1).to(device=z.device, dtype=z.dtype)
+        vae_scale = torch.sqrt(self.autoencoder.bn.running_var.view(1, -1, 1, 1) + self.autoencoder.bn_eps).to(device=z.device, dtype=z.dtype)
+        return z.sub(vae_mean).div(vae_scale)
 
     @torch.inference_mode()
     def __call__(
@@ -337,7 +348,7 @@ class Ideogram4WanPipeline:
         )
         if image is None:
             return None
-        return image.unsqueeze(1).cpu()
+        return image.cpu().transpose(0, 1)
 
 
 class model_factory:
@@ -396,18 +407,16 @@ class model_factory:
         self,
         seed=None,
         input_prompt="",
-        sampling_steps=20,
         sample_solver="",
         width=1024,
         height=1024,
         guide_scale=7.0,
-        shift=None,
         batch_size=1,
         model_mode=_DEFAULT_PRESET,
         pid_upsampler=None,
         set_progress_status=None,
         callback=None,
-        **bkwargs,
+        **kwargs,
     ):
         preset_name = model_mode if model_mode in PRESETS else sample_solver if sample_solver in PRESETS else _DEFAULT_PRESET
         preset = PRESETS[preset_name]
