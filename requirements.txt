@@ -37,6 +37,8 @@ jax
 
 # UI & interaction
 gradio==5.29.0
+openai>=1.40.0
+pywebview>=5.0
 dashscope
 loguru
 s3tokenizer

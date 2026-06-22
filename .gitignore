@@ -22,6 +22,7 @@
 *.pkl
 *.html
 !plugins/motion_designer/assets/motion_designer_iframe_template.html
+!ideogram_studio/ui/index.html
 *.pdf
 *.whl
 *.exe
@@ -46,6 +47,7 @@ loras_i2v/
 venv/
 
 wgp_config.json
+ideogram_studio/config.json
 plugins_local.json
 loras_url_cache.json
 loras_url_cache_v2.json

@@ -16,7 +16,9 @@ def _popup_dims(model_def):
     return max(35, min(width, 96)), max(35, min(height, 100))
 
 
-def render_prompt_helper(model_type, model_def, prompt_id, popup_id, prompt_elem_id, resolution_elem_id):
+def render_prompt_helper(
+    model_type, model_def, prompt_id, popup_id, prompt_elem_id, resolution_elem_id
+):
     width, height = _popup_dims(model_def)
     config = {
         "promptTarget": prompt_elem_id,

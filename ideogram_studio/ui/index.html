@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ideogram Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@500;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <style>{{PROMPT_HELPER_CSS}}</style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">◆</span>
+        <div>
+          <div class="brand-title">Ideogram Studio</div>
+          <div class="brand-sub">WanGP engine · DeepSeek magic prompt</div>
+        </div>
+      </div>
+      <div class="topbar-status" id="engine-status">Starting engine…</div>
+      <button type="button" class="ghost-btn" id="settings-toggle" aria-expanded="false">Settings</button>
+    </header>
+
+    <aside class="settings-drawer" id="settings-drawer" hidden>
+      <h2>Settings</h2>
+      <label>DeepSeek API key<input id="cfg-api-key" type="password" autocomplete="off" placeholder="sk-…" /></label>
+      <label>DeepSeek model
+        <select id="cfg-model"></select>
+      </label>
+      <label class="checkbox-row">
+        <input id="cfg-thinking" type="checkbox" />
+        <span>Thinking mode (slower; V4 Flash/Pro only)</span>
+      </label>
+      <label>WanGP profile<input id="cfg-profile" type="text" placeholder="e.g. 4" /></label>
+      <label>Output dir<input id="cfg-output" type="text" placeholder="optional override" /></label>
+      <button type="button" class="primary-btn" id="save-settings">Save settings</button>
+    </aside>
+
+    <main class="workspace">
+      <section class="panel panel-idea">
+        <div class="panel-head">
+          <h2>Idea</h2>
+          <p>Short natural-language brief. Magic Prompt expands it to Ideogram JSON.</p>
+        </div>
+        <textarea id="idea-text" rows="5" placeholder="Neon jazz festival poster, bold typography, rain-slick pavement…"></textarea>
+        <div class="field-row">
+          <label>Aspect ratio
+            <select id="aspect-ratio"></select>
+          </label>
+          <label>Resolution
+            <select id="resolution-select"></select>
+          </label>
+        </div>
+        <div class="field-row">
+          <label>Model
+            <select id="model-type"></select>
+          </label>
+          <label>Preset
+            <select id="model-mode"></select>
+          </label>
+        </div>
+        <div class="field-row">
+          <label>Seed
+            <input id="seed-input" type="number" value="-1" />
+          </label>
+        </div>
+        <button type="button" class="accent-btn" id="magic-btn">✦ Magic Prompt</button>
+        <label class="json-label">JSON prompt
+          <div id="prompt-json-host">
+            <textarea id="prompt-json" rows="14" spellcheck="false" placeholder="Magic Prompt output or hand-written JSON…"></textarea>
+          </div>
+        </label>
+        <div class="action-row">
+          <button type="button" class="primary-btn" id="generate-btn">Generate</button>
+          <button type="button" class="ghost-btn" id="cancel-btn" disabled>Cancel</button>
+        </div>
+        <div class="status-line" id="status-line"></div>
+      </section>
+
+      <section class="panel panel-layout">
+        <div class="panel-head panel-head-row">
+          <div>
+            <h2>Layout</h2>
+            <p>Drag boxes to move · edges to resize · draw on empty canvas · double-click box text to edit.</p>
+          </div>
+          <button type="button" class="ghost-btn layout-sync-btn" id="sync-layout-btn">Sync JSON</button>
+        </div>
+        <div
+          class="ideogram4-prompt-helper layout-helper"
+          data-ideogram4-prompt-helper
+          data-ideogram4-config='{"promptTarget":"prompt-json-host","resolutionTarget":"resolution-select","promptId":"","modelType":"ideogram4"}'
+        >
+          <div class="ideogram4-prompt-helper-content" data-ideogram4-prompt-helper-content></div>
+        </div>
+      </section>
+
+      <section class="panel panel-output">
+        <div class="panel-head">
+          <h2>Output</h2>
+          <p>Live preview and final render.</p>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+          <div class="progress-label" id="progress-label">Idle</div>
+        </div>
+        <div class="preview-frame" id="preview-frame">
+          <div class="preview-empty">No image yet</div>
+          <img id="preview-image" alt="Generation preview" hidden />
+        </div>
+        <div class="output-path" id="output-path"></div>
+      </section>
+    </main>
+  </div>
+
+  <script>{{PROMPT_HELPER_JS}}</script>
+  <script src="app.js"></script>
+</body>
+</html>

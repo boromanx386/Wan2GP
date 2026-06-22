@@ -1,0 +1,15 @@
+{
+  "deepseek_api_key": "",
+  "deepseek_base_url": "https://api.deepseek.com",
+  "deepseek_model": "deepseek-v4-flash",
+  "deepseek_thinking": false,
+  "deepseek_temperature": 0.5,
+  "deepseek_max_tokens": 2048,
+  "model_type": "ideogram4",
+  "model_mode": "V4_DEFAULT_20",
+  "resolution": "1024x1024",
+  "aspect_ratio": "1:1",
+  "wgp_profile": "",
+  "wgp_cli_args": [],
+  "output_dir": ""
+}
