@@ -7,11 +7,11 @@ from shared.utils.hf import build_hf_url
 
 _PROJECT_REPO = "DeepBeepMeep/krea-2"
 _QWEN_IMAGE_REPO = "DeepBeepMeep/Qwen_image"
-_PROJECT_FOLDER = "krea2"
 _TEXT_ENCODER_FOLDER = "Qwen3-VL-4B-Instruct"
 _RAW_MODEL_TYPE = "krea2_raw"
 _TURBO_MODEL_TYPE = "krea2_turbo"
-
+_PROFILE_DIR = "krea2"
+_PRESET_PROFILE_DIR = "krea2_presets"
 
 class family_handler:
     @staticmethod
@@ -21,7 +21,8 @@ class family_handler:
             "guidance_max_phases": 1 if base_model_type == _RAW_MODEL_TYPE else 0,
             "inference_steps": True,
             "fit_into_canvas_image_refs": 0,
-            "profiles_dir": [base_model_type],
+            "preset_profiles_dir": [_PRESET_PROFILE_DIR],
+            "profiles_dir": [_PROFILE_DIR],
             "text_encoder_folder": _TEXT_ENCODER_FOLDER,
             "text_encoder_URLs": [
                 build_hf_url(_PROJECT_REPO, _TEXT_ENCODER_FOLDER, "Qwen3-VL-4B-Instruct_bf16.safetensors"),
@@ -29,6 +30,7 @@ class family_handler:
             ],
             "no_negative_prompt": base_model_type == _TURBO_MODEL_TYPE,
             "no_background_removal": True,
+            "resolutions_categories": ["<=2k"],
             "vae_block_size": 16,
         }
 
@@ -61,9 +63,8 @@ class family_handler:
         return [
             {
                 "repoId": _PROJECT_REPO,
-                "sourceFolderList": [_PROJECT_FOLDER, _TEXT_ENCODER_FOLDER],
+                "sourceFolderList": [_TEXT_ENCODER_FOLDER],
                 "fileList": [
-                    ["krea2_transformer_config.json"],
                     ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"],
                 ],
             },
