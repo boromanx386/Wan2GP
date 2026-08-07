@@ -34,7 +34,7 @@ _ENV_AUTOTUNE_VALIDATE = "WAN2GP_QUANTO_INT8_AUTOTUNE_VALIDATE"
 _ENV_AUTOTUNE_MAX_ABS_ERR = "WAN2GP_QUANTO_INT8_AUTOTUNE_MAX_ABS_ERR"
 _ENV_AUTOTUNE_MAX_REL_ERR = "WAN2GP_QUANTO_INT8_AUTOTUNE_MAX_REL_ERR"
 _ENV_AUTOTUNE_LOCK_FUSED_BLOCK_K = "WAN2GP_QUANTO_INT8_AUTOTUNE_LOCK_FUSED_BLOCK_K"
-_IS_AVAILABLE = None
+_IS_AVAILABLE = {}
 _CONFIG_LEN = 5
 _AUTOTUNE_CACHE_VERSION = 2
 _AUTOTUNE_CACHE_LOADED = False
@@ -44,6 +44,12 @@ _AUTOTUNE_SESSION_CACHE: dict[tuple[int, str, str], tuple[int, int, int, int, in
 _AUTOTUNE_SEEN_SLOTS: set[tuple[int, str, str]] = set()
 _AUTOTUNE_SLOTS_TUNED = 0
 _AUTOTUNE_DEBUG_OVERRIDE: Optional[bool] = None
+
+# Triton reports this staged large-M int8 tile as requiring 102400 bytes of
+# shared memory on SM120, while some cards expose only 101376 bytes per block.
+_HIGH_SHARED_MEMORY_CONFIG = (64, 256, 64, 8, 4)
+_HIGH_SHARED_MEMORY_CONFIG_BYTES = 102400
+_LOW_SHARED_MEMORY_CONFIG = (64, 256, 64, 8, 3)
 
 # Tuned decode-time configs reused from nanovllm int8 kernels.
 _TRITON_SMALL_M_CONFIGS = {
@@ -150,11 +156,11 @@ def set_autotune_debug(enabled: Optional[bool] = None) -> None:
     _AUTOTUNE_DEBUG_OVERRIDE = None if enabled is None else bool(enabled)
 
 
-def _runtime_compatible() -> bool:
+def _runtime_compatible(device=None) -> bool:
     if not (_TRITON_AVAILABLE and torch.cuda.is_available()):
         return False
     try:
-        cc_major, _ = torch.cuda.get_device_capability()
+        cc_major, _ = torch.cuda.get_device_capability(device)
     except Exception:
         return False
 
@@ -170,11 +176,14 @@ def _runtime_compatible() -> bool:
     return True
 
 
-def is_available() -> bool:
-    global _IS_AVAILABLE
-    if _IS_AVAILABLE is None:
-        _IS_AVAILABLE = bool(_runtime_compatible() and _env_flag(_ENV_ENABLE, "1"))
-    return _IS_AVAILABLE
+def is_available(device=None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    device_index = torch.cuda.current_device() if device is None else torch.device(device).index
+    device_index = torch.cuda.current_device() if device_index is None else device_index
+    if device_index not in _IS_AVAILABLE:
+        _IS_AVAILABLE[device_index] = bool(_runtime_compatible(device) and _env_flag(_ENV_ENABLE, "1"))
+    return _IS_AVAILABLE[device_index]
 
 
 def _select_static_triton_int8_config(m: int, k: int, n: int) -> tuple[int, int, int, int, int]:
@@ -394,6 +403,8 @@ def _config_compatible_with_baseline(
     baseline: tuple[int, int, int, int, int],
     cfg: tuple[int, int, int, int, int],
 ) -> bool:
+    if baseline == _LOW_SHARED_MEMORY_CONFIG and cfg == _HIGH_SHARED_MEMORY_CONFIG:
+        return False
     if kind == "fused" and _env_flag(_ENV_AUTOTUNE_LOCK_FUSED_BLOCK_K, "1"):
         # Fused blockscale kernel computes row scales per K-chunk; changing block_k changes numerics.
         return int(cfg[2]) == int(baseline[2])
@@ -867,6 +878,11 @@ def _select_triton_int8_config(
         device_index = _device_index(device)
     except Exception:
         return baseline
+    if baseline == _HIGH_SHARED_MEMORY_CONFIG:
+        props = torch.cuda.get_device_properties(device_index)
+        limit = int(getattr(props, "shared_memory_per_block_optin", getattr(props, "shared_memory_per_block", 0)) or 0)
+        if limit > 0 and limit < _HIGH_SHARED_MEMORY_CONFIG_BYTES:
+            baseline = _LOW_SHARED_MEMORY_CONFIG
     slot_id, rep_shapes = _resolve_autotune_slot(m, k, n)
     session_key = (device_index, kernel_kind, slot_id)
     cached = _AUTOTUNE_SESSION_CACHE.get(session_key)
@@ -1270,6 +1286,7 @@ def scaled_int8_mm(
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
     out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if not is_available():
         raise RuntimeError("Triton backend not available")
@@ -1299,7 +1316,10 @@ def scaled_int8_mm(
         b_scale = b_scale.contiguous()
 
     out_dtype = out_dtype or torch.bfloat16
-    out = torch.empty((m, n), device=a_int8.device, dtype=out_dtype)
+    if out is None:
+        out = torch.empty((m, n), device=a_int8.device, dtype=out_dtype)
+    elif out.shape != (m, n) or out.device != a_int8.device or out.dtype != out_dtype:
+        raise RuntimeError(f"Invalid scaled_int8_mm output tensor: expected {(m, n)} {out_dtype} on {a_int8.device}, got {tuple(out.shape)} {out.dtype} on {out.device}")
     a_int8_c = a_int8 if a_int8.is_contiguous() else a_int8.contiguous()
     b_int8_c = b_int8 if b_int8.is_contiguous() else b_int8.contiguous()
     a_scale_c = a_scale if a_scale.is_contiguous() else a_scale.contiguous()
