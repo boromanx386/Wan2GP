@@ -82,6 +82,16 @@ _GGUF_TYPED_TENSOR_DTYPES = {
     None if gguf is None else gguf.GGMLQuantizationType.I32: np.int32,
     None if gguf is None else gguf.GGMLQuantizationType.I64: np.int64,
 }
+_GGUF_TYPED_TENSOR_TORCH_DTYPES = {
+    None if gguf is None else gguf.GGMLQuantizationType.F16: torch.float16,
+    None if gguf is None else gguf.GGMLQuantizationType.BF16: torch.bfloat16,
+    None if gguf is None else gguf.GGMLQuantizationType.F32: torch.float32,
+    None if gguf is None else gguf.GGMLQuantizationType.F64: torch.float64,
+    None if gguf is None else gguf.GGMLQuantizationType.I8: torch.int8,
+    None if gguf is None else gguf.GGMLQuantizationType.I16: torch.int16,
+    None if gguf is None else gguf.GGMLQuantizationType.I32: torch.int32,
+    None if gguf is None else gguf.GGMLQuantizationType.I64: torch.int64,
+}
 
 
 @dataclass(frozen=True)
@@ -199,6 +209,17 @@ def _gguf_cuda_module():
     if not _gguf_cuda_kernels_enabled():
         return None
     return _GGUF_CUDA_MODULE
+
+
+def get_gguf_compute_dtype():
+    module = _gguf_cuda_module()
+    if module is None:
+        return torch.bfloat16
+    try:
+        version = tuple(int(part) for part in module.__version__.split("+", 1)[0].split(".")[:3])
+    except (AttributeError, TypeError, ValueError):
+        return torch.float16
+    return torch.bfloat16 if version >= (1, 0, 7) else torch.float16
 
 
 def set_gguf_cuda_kernels_enabled(enabled=None):
@@ -471,8 +492,14 @@ def get_file_metadata(file_path):
     if cached is not None:
         state_dict, metadata = cached
         return OrderedDict(state_dict), dict(metadata)
-    metadata = _get_lightweight_gguf_metadata(file_path)
-    result = (OrderedDict(), metadata)
+    from mmgp.safetensors2 import tensor_stub
+    parsed = _gguf_get_index(file_path)
+    orig_shapes = dict(parsed.orig_shapes)
+    state_dict = OrderedDict((tensor.name, tensor_stub(_GGUF_TYPED_TENSOR_TORCH_DTYPES.get(tensor.tensor_type, torch.uint8),
+                                                       orig_shapes.get(tensor.name, tuple(reversed(tensor.raw_shape)))))
+                             for tensor in parsed.tensor_infos)
+    metadata = {"config": parsed.config} if parsed.config is not None else {}
+    result = (state_dict, metadata)
     _GGUF_METADATA_CACHE[cache_key] = (OrderedDict(result[0]), dict(result[1]))
     return OrderedDict(result[0]), dict(result[1])
 
@@ -1381,6 +1408,37 @@ class GGUFWeightTensor(QTensor):
                 tensor_shape=getattr(t, "_tensor_shape", None),
             )
         return _gguf_qfallback(op, *args, **(kwargs or {}))
+
+
+class GGUFFirstRowsLinear(torch.nn.Module):
+    """Zero-copy linear view over a contiguous prefix of GGUF weight rows."""
+
+    def __init__(self, source: torch.nn.Module, row_count: int):
+        super().__init__()
+        self.register_parameter("weight", source.weight)
+        self.row_count = int(row_count)
+        object.__setattr__(self, "_cached_raw", None)
+        object.__setattr__(self, "_cached_weight", None)
+
+    def clear_cache(self) -> None:
+        object.__setattr__(self, "_cached_raw", None)
+        object.__setattr__(self, "_cached_weight", None)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        source_weight = self.weight
+        if not isinstance(source_weight, GGUFWeightTensor):
+            raise TypeError(f"GGUFFirstRowsLinear requires GGUFWeightTensor, got {type(source_weight).__name__}.")
+        full_rows, in_features = map(int, source_weight._tensor_shape)
+        if not 0 < self.row_count <= full_rows or source_weight._data.numel() % full_rows:
+            raise RuntimeError(f"Cannot make a {self.row_count}-row view of GGUF weight {tuple(source_weight._tensor_shape)}.")
+        source_raw = source_weight._data
+        if self._cached_raw is not source_raw:
+            row_bytes = source_raw.numel() // full_rows
+            raw = source_raw[:self.row_count * row_bytes]
+            weight = GGUFWeightTensor.create(raw, (self.row_count, in_features), (in_features, 1), source_weight.dtype, tensor_type=source_weight._tensor_type, tensor_shape=(self.row_count, in_features))
+            object.__setattr__(self, "_cached_raw", source_raw)
+            object.__setattr__(self, "_cached_weight", weight)
+        return self._cached_weight.linear(input)
 
 
 class QLinearGGUF(QModuleMixin, torch.nn.Linear):

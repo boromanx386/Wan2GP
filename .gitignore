@@ -51,5 +51,7 @@ wgp_config.json
 ideogram_studio/config.json
 ideogram_studio/demo-video/
 plugins_local.json
+/plugins/wan2gp-*/
+/plugins/wangp-*/
 loras_url_cache.json
 loras_url_cache_v2.json

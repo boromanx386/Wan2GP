@@ -53,6 +53,24 @@ def unpatchify_video(rows, t, h, w, c=24, patch_size=(1, 2, 2)):
     return unpatchify_video_tokens(rows, t, h * patch_size[1], w * patch_size[2], c, patch_size)
 
 
+def _grouped_video_timestep_rows(timestep, timestep_indices, video_start, target_video_rows, fixed_rows, active):
+    current_row = int(timestep_indices[video_start])
+    if not active or not fixed_rows:
+        return timestep, timestep_indices, current_row, [(video_start, video_start + target_video_rows,
+                                                          current_row * 3 + MINIMAX_H3_VIDEO_TAG)]
+    timestep_count = timestep.shape[0]
+    timestep, remap = torch.unique(torch.cat((timestep, timestep.new_tensor([VISUAL_COND_TIMESTEP]))), sorted=True, return_inverse=True)
+    timestep_indices = remap[:timestep_count][timestep_indices]
+    current_row, fixed_row = int(timestep_indices[video_start]), int(remap[-1])
+    head_rows = [(0, fixed_rows, fixed_row)]
+    block_rows = [(video_start, video_start + fixed_rows, fixed_row * 3 + MINIMAX_H3_VIDEO_TAG)]
+    if fixed_rows < target_video_rows:
+        head_rows.append((fixed_rows, target_video_rows, current_row))
+        block_rows.append((video_start + fixed_rows, video_start + target_video_rows,
+                           current_row * 3 + MINIMAX_H3_VIDEO_TAG))
+    return timestep, timestep_indices, head_rows, block_rows
+
+
 def pack_audio(latent):
     return latent[0].permute(1, 2, 0).reshape(-1, latent.shape[1]).contiguous()
 
@@ -68,10 +86,14 @@ def _split_interleaved_qkv(src, dim, split_sizes, context):
     return [grouped[:, index].reshape(split_sizes[index], *src.shape[1:]).contiguous() for index in range(3)]
 
 
-def get_linear_split_map(inner_size, num_attention_heads=56, attention_head_dim=128):
-    return {"qkv_proj": {"mapped_modules": ["q_proj", "k_proj", "v_proj"], "split_sizes": [inner_size] * 3,
-                         "num_attention_heads": num_attention_heads, "attention_head_dim": attention_head_dim,
-                         "split_handlers": {"weight": _split_interleaved_qkv}}}
+def get_linear_split_map(inner_size, num_attention_heads=56, attention_head_dim=128, qkv_layout="interleaved"):
+    if qkv_layout not in ("interleaved", "grouped"):
+        raise ValueError(f"Unsupported MiniMax H3 QKV layout {qkv_layout!r}")
+    split = {"mapped_modules": ["q_proj", "k_proj", "v_proj"], "split_sizes": [inner_size] * 3,
+             "num_attention_heads": num_attention_heads, "attention_head_dim": attention_head_dim}
+    if qkv_layout == "interleaved":
+        split["split_handlers"] = {"weight": _split_interleaved_qkv}
+    return {"qkv_proj": split}
 
 
 def _take(x_list):
@@ -339,7 +361,11 @@ class FinalLayer(nn.Module):
 
     def _head(self, h_list, shift, scale, row, output):
         value = self.norm(_take(h_list)).to(scale.dtype)
-        value.mul_(1.0 + scale[row]).add_(shift[row])
+        if isinstance(row, list):
+            for start, stop, index in row:
+                value[start:stop].mul_(1.0 + scale[index]).add_(shift[index])
+        else:
+            value.mul_(1.0 + scale[row]).add_(shift[row])
         value = value.to(output.weight.dtype)
         return output(value)
 
@@ -445,7 +471,7 @@ class MiniMaxH3Model(nn.Module):
                  timestep_input_dim=256, time_embed_hidden_size=5376, time_embed_dim=2688,
                  rope_inv_freq_len=16, rope_theta=10000.0, norm_eps=1e-5, qk_norm_eps=1e-5,
                  final_norm_eps=1e-5, sigma_shift_video=12.0, sigma_shift_audio=3.0,
-                 ffn_chunk_size=2048, adaln_curve_grid=None, image_model=None,
+                 ffn_chunk_size=2048, adaln_curve_grid=None, adaln_dtype=torch.float32, image_model=None,
                  dtype=None, device=None, **kwargs):
         super().__init__()
         self._interrupt = False
@@ -462,7 +488,7 @@ class MiniMaxH3Model(nn.Module):
         self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True, dtype=torch.float32, device=device)
         self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True, dtype=dtype, device=device)
         if self.use_adaln_curves:
-            self.register_buffer("adaln_t_table", torch.empty(adaln_curve_grid, time_embed_dim, dtype=torch.float32, device=device))
+            self.register_buffer("adaln_t_table", torch.empty(adaln_curve_grid, time_embed_dim, dtype=adaln_dtype, device=device))
         else:
             self.time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim,
                                               dtype=torch.float32, device=device)
@@ -472,7 +498,7 @@ class MiniMaxH3Model(nn.Module):
                                           final_norm_eps, dtype=dtype, device=device)
         self.sol_attention = MiniMaxH3SolAttention()
         curve = {"apply_silu": not self.use_adaln_curves,
-                 "adaln_dtype": torch.float32 if self.use_adaln_curves else dtype}
+                 "adaln_dtype": adaln_dtype if self.use_adaln_curves else dtype}
         self.blocks = nn.ModuleList([DiTBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size,
                                                time_embed_dim, norm_eps, qk_norm_eps, **curve,
                                                ffn_chunk_size=ffn_chunk_size, sol_attention=self.sol_attention,
@@ -481,8 +507,8 @@ class MiniMaxH3Model(nn.Module):
                                       final_norm_eps, **curve, dtype=dtype, device=device)
         fp32_modules = [self.video_patch_proj, self.audio_patch_proj, self.final_layer.video_out, self.final_layer.audio_out]
         if self.use_adaln_curves:
-            fp32_modules.extend(block.adaln_proj.linear for block in self.blocks)
-            fp32_modules.append(self.final_layer.adaln_proj.linear)
+            for module in (*[block.adaln_proj.linear for block in self.blocks], self.final_layer.adaln_proj.linear):
+                module._lock_dtype = adaln_dtype
         else:
             fp32_modules.extend((self.time_embedder.proj_in, self.time_embedder.proj_out))
         for module in fp32_modules:
@@ -499,22 +525,39 @@ class MiniMaxH3Model(nn.Module):
             raise GenerationInterrupted
 
     def _layout(self, text_tags, latent_t, latent_h, latent_w, audio_t, payload):
+        target_spatial_context = payload.get("target_spatial_context")
         signature = (text_tags.numel(), latent_t, latent_h, latent_w, audio_t,
                      payload["fps"],
-                     tuple(k["resolved_frame_index"] for k in payload.get("keyframes") or ()),
+                     target_spatial_context,
+                     payload.get("target_audio_condition_latents", 0),
+                     payload.get("target_video_condition_frames", 0),
+                     tuple((k["anchor"], k["latent_frame_count"], k.get("frame_index")) for k in payload.get("keyframes") or ()),
+                     tuple((k["anchor"], k["latent_frame_count"]) for k in payload.get("audio_keyframes") or ()),
                      tuple((r["kind"], r.get("latent_t"), r.get("latent_h"), r.get("latent_w"), r.get("ref_audio_t"))
                            for r in payload.get("refs") or ()))
         if payload.get("layout_signature") == signature:
             return payload["layout"]
         with torch.device("cpu"):
             video_time_scale = 24.0 / payload["fps"]
+            anchors = tuple((keyframe["anchor"], keyframe["latent_frame_count"], keyframe.get("frame_index"))
+                            for keyframe in payload.get("keyframes") or ())
+            audio_anchors = tuple((keyframe["anchor"], keyframe["latent_frame_count"])
+                                  for keyframe in payload.get("audio_keyframes") or ())
+            target_audio_condition_latents = payload.get("target_audio_condition_latents", 0)
+            target_video_condition_frames = payload.get("target_video_condition_frames", 0)
             if payload.get("refs"):
                 layout = build_ref2va_packed_sequence(text_tags, _prepared_references(payload["refs"]), latent_t,
-                                                      latent_h, latent_w, audio_t, self.patch_size, video_time_scale)
+                                                      latent_h, latent_w, audio_t, self.patch_size, video_time_scale,
+                                                      keyframe_anchors=anchors, audio_condition_anchors=audio_anchors,
+                                                      target_condition_audio_latents=target_audio_condition_latents,
+                                                      target_condition_video_frames=target_video_condition_frames,
+                                                      target_spatial_context=target_spatial_context)
             else:
-                anchors = tuple("first" if keyframe["resolved_frame_index"] == 0 else "last"
-                                for keyframe in payload.get("keyframes") or ())
-                layout = build_packed_sequence(text_tags, latent_t, latent_h, latent_w, audio_t, self.patch_size, anchors, video_time_scale)
+                layout = build_packed_sequence(text_tags, latent_t, latent_h, latent_w, audio_t, self.patch_size,
+                                               anchors, video_time_scale, audio_condition_anchors=audio_anchors,
+                                               target_condition_audio_latents=target_audio_condition_latents,
+                                               target_condition_video_frames=target_video_condition_frames,
+                                               target_spatial_context=target_spatial_context)
         payload["layout_signature"], payload["layout"] = signature, layout
         return layout
 
@@ -524,15 +567,24 @@ class MiniMaxH3Model(nn.Module):
         table = self.adaln_t_table
         position = timesteps.clamp(0.0, 1.0) * (table.shape[0] - 1)
         lower = position.floor().long().clamp(max=table.shape[0] - 2)
-        return torch.lerp(table[lower], table[lower + 1], (position - lower).unsqueeze(1))
+        return torch.lerp(table[lower], table[lower + 1], (position - lower).unsqueeze(1).to(table.dtype))
 
     def forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload, spectrum=None, first_block_cache=None):
         device, dtype = video_x.device, self.dtype or next(self.blocks.parameters()).dtype
         video_dtype, audio_dtype = video_x.dtype, audio_x.dtype
         _, _, latent_t, latent_h, latent_w = video_x.shape
+        sigma_video = sigma_video.flatten()
+        if sigma_video.numel() not in (1, latent_t):
+            raise ValueError(f"MiniMax H3 received {sigma_video.numel()} video sigmas for {latent_t} latent frames")
+        if sigma_video.numel() > 1 and not bool((sigma_video == sigma_video[0]).all()):
+            raise ValueError("MiniMax H3 requires one uniform video sigma")
         audio_t = audio_x.shape[-1]
         text_tags = payload["text_token_tags"].view(-1).cpu()
         layout = self._layout(text_tags, latent_t, latent_h, latent_w, audio_t, payload)
+        target_video_order = payload.get("target_video_order")
+        target_video_inverse_order = payload.get("target_video_inverse_order")
+        target_video_fixed_rows = payload.get("target_video_fixed_rows", 0)
+        target_video_mask_active = payload.get("target_video_mask_active", False)
 
         if spectrum is not None and spectrum.forecasting:
             timestep, timestep_indices = build_row_timesteps(
@@ -543,23 +595,33 @@ class MiniMaxH3Model(nn.Module):
                 AUDIO_COND_TIMESTEP,
             )
             timestep, timestep_indices = timestep.to(device), timestep_indices.to(device)
-            temb = self._time_embedding(timestep)
             target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])
             target_audio_rows = audio_t * 2
             video_start = layout.sequence_length - target_video_rows
             audio_start = video_start - target_audio_rows
-            video_row = int(timestep_indices[video_start])
-            audio_row = int(timestep_indices[audio_start])
+            if target_video_order is None:
+                video_row = int(timestep_indices[video_start])
+            else:
+                timestep, timestep_indices, video_row, _ = _grouped_video_timestep_rows(
+                    timestep, timestep_indices, video_start, target_video_rows,
+                    target_video_fixed_rows, target_video_mask_active)
+            temb = self._time_embedding(timestep)
+            audio_row = int(timestep_indices[audio_start + min(layout.num_target_condition_audio_latents,
+                                                               max(audio_t - 1, 0))])
             hidden = spectrum.predict(device, dtype, self._check_interrupt)
             video, audio = self.final_layer([hidden], temb, (target_audio_rows, target_audio_rows + target_video_rows, video_row),
                                             (0, target_audio_rows, audio_row))
             del temb, timestep_indices
+            if target_video_inverse_order is not None:
+                video = video.index_select(0, target_video_inverse_order)
             video = _to_dtype([video], video_dtype)
             audio = _to_dtype([audio], audio_dtype)
             return (unpatchify_video_tokens(video, latent_t, latent_h, latent_w, self.latents_dim, self.patch_size),
                     unpack_audio(audio))
 
         video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
+        if target_video_order is not None:
+            video_rows = video_rows.index_select(0, target_video_order)
         audio_rows = pack_audio(audio_x.to(torch.float32))
         cond_video, cond_audio = payload.get("cond_video_rows"), payload.get("cond_audio_rows")
         if cond_video is not None:
@@ -588,25 +650,50 @@ class MiniMaxH3Model(nn.Module):
             AUDIO_COND_TIMESTEP,
         )
         timestep, timestep_indices = timestep.to(device), timestep_indices.to(device)
+        target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])
+        video_start = layout.sequence_length - target_video_rows
+        video_head_row = int(timestep_indices[video_start])
+        frame_rows = grouped_segments = None
+        if target_video_order is not None:
+            timestep, timestep_indices, video_head_row, grouped_segments = _grouped_video_timestep_rows(
+                timestep, timestep_indices, video_start, target_video_rows,
+                target_video_fixed_rows, target_video_mask_active)
+        elif sigma_video.numel() == latent_t:
+            frame_timesteps = 1.0 - sigma_video.to(device=device, dtype=torch.float32)
+            timestep, remap = torch.unique(torch.cat((timestep, frame_timesteps)), sorted=True, return_inverse=True)
+            timestep_indices = remap[:timestep_indices.max().item() + 1][timestep_indices]
+            frame_rows = remap[-latent_t:]
+            video_head_row = [(index * (target_video_rows // latent_t), (index + 1) * (target_video_rows // latent_t), int(row))
+                              for index, row in enumerate(frame_rows)]
         adaln_indices = timestep_indices * 3 + layout.token_tags.to(device).clamp_min(0)
         changes = torch.cat((torch.ones(1, dtype=torch.bool, device=device), adaln_indices[1:] != adaln_indices[:-1],
                              torch.ones(1, dtype=torch.bool, device=device))).nonzero().flatten()
         segments = [(int(changes[index]), int(changes[index + 1]), int(adaln_indices[changes[index]]))
                     for index in range(changes.numel() - 1)]
+        if frame_rows is not None:
+            segments = [segment for segment in segments if segment[0] < video_start]
+            rows_per_frame = target_video_rows // latent_t
+            segments.extend((video_start + index * rows_per_frame, video_start + (index + 1) * rows_per_frame,
+                             int(row) * 3 + MINIMAX_H3_VIDEO_TAG) for index, row in enumerate(frame_rows))
+        elif grouped_segments is not None:
+            segments = [segment for segment in segments if segment[0] < video_start]
+            segments.extend(grouped_segments)
         temb = self._time_embedding(timestep)
         rope = payload.get("rope")
         if rope is None:
             positions = layout.position_ids.to(torch.float32)
             frequencies = positions.unsqueeze(-1) * self.rope.inv_freq.detach().cpu().view(1, 1, -1)
             rope = _rope_table(torch.cat(frequencies.unbind(dim=1), dim=-1), dtype).to(device)
+            if target_video_order is not None:
+                target_rope = rope[:, video_start:].index_select(1, target_video_order)
+                rope[:, video_start:].copy_(target_rope)
+                del target_rope
             payload["rope"] = rope
             del positions, frequencies
         del adaln_indices, changes
-        target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])
         target_audio_rows = audio_t * 2
-        video_start = layout.sequence_length - target_video_rows
         audio_start = video_start - target_audio_rows
-        self.sol_attention.begin_forward(layout, device, dtype)
+        self.sol_attention.begin_forward(layout, device, dtype, payload["attention_sparsity"], target_video_order is not None)
 
         if first_block_cache is None:
             for block in self.blocks:
@@ -627,15 +714,17 @@ class MiniMaxH3Model(nn.Module):
             else:
                 first_block_cache.apply_tail_residual(hidden[audio_start:])
 
-        video_row = int(timestep_indices[video_start])
-        audio_row = int(timestep_indices[audio_start])
+        audio_row = int(timestep_indices[audio_start + min(layout.num_target_condition_audio_latents,
+                                                           max(audio_t - 1, 0))])
         if spectrum is not None:
-            spectrum.observe(hidden[audio_start:], self._check_interrupt)
+            spectrum.observe(hidden[audio_start:], target_audio_rows, self._check_interrupt)
         h_list = [hidden]
         hidden = None
-        video, audio = self.final_layer(h_list, temb, (video_start, layout.sequence_length, video_row),
+        video, audio = self.final_layer(h_list, temb, (video_start, layout.sequence_length, video_head_row),
                                         (audio_start, video_start, audio_row))
         del temb, rope, timestep_indices
+        if target_video_inverse_order is not None:
+            video = video.index_select(0, target_video_inverse_order)
         video = _to_dtype([video], video_dtype)
         audio = _to_dtype([audio], audio_dtype)
         return (unpatchify_video_tokens(video, latent_t, latent_h, latent_w, self.latents_dim, self.patch_size),
