@@ -9,7 +9,7 @@ import sys
 
 from ..config import Config
 from .sequence import Sequence
-from ..layers.sampler import Sampler
+from ..layers.sampler import Sampler, _REPETITION_INCREMENT_LIMIT, apply_sparse_repetition_penalty_
 from ..utils.context import set_context, get_context, reset_context
 
 import socket
@@ -43,7 +43,7 @@ def find_available_port(start_port: int = 2333, max_attempts: int = 100) -> int:
 
 class ModelRunner:
 
-    _MAX_SPECULATIVE_DRAFT_TOKENS = 5
+    _MAX_SPECULATIVE_DRAFT_TOKENS = 2
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event], model_object=None, graph_pool_handle=None):
         # Enable capturing scalar outputs to avoid graph breaks from Tensor.item() calls
@@ -96,8 +96,10 @@ class ModelRunner:
         self._graph_cache = {}
         self._graph_cache_order = []
         self._logits_bias_cache = {}
+        self._repetition_token_cache = {}
         self._sampling_generator = None
         self._runtime_signature = None
+        self._model_storage_signature = None
         self._graph_pool_seed = graph_pool_handle
         self._guard_counts = {}
         self._guard_seen_details = set()
@@ -167,6 +169,7 @@ class ModelRunner:
         except Exception:
             pass
         self._logits_bias_cache.clear()
+        self._repetition_token_cache.clear()
         self._speculative_drafts.clear()
         self._speculative_pending.clear()
         self.speculative_stats = self._new_speculative_stats()
@@ -187,6 +190,9 @@ class ModelRunner:
         if self.model is None:
             return
         runtime_device = self._get_runtime_device()
+        if self.model.__class__.__name__ == "Qwen3_5ForCausalLM":
+            from ..models.qwen3_5 import configure_qwen35_fla_prefill_autotune
+            configure_qwen35_fla_prefill_autotune(runtime_device)
         for module in self.model.modules():
             prepare = getattr(module, "prepare_sequence_state", None)
             if callable(prepare):
@@ -231,6 +237,15 @@ class ModelRunner:
     def reset_runtime_state(self):
         if not self._runtime_ready:
             return
+        # Steering/interruption may reach teardown while the last CUDA-graph replay
+        # is still in flight.  Every object released below can own storage whose raw
+        # address is embedded in a decode/speculative/MTP graph, so the device must
+        # finish using those addresses before graph/cache/module references are
+        # destroyed and their allocations become reusable.
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
         # Clear attention KV cache refs so we don't write into freed storage later.
         try:
             if self.model is not None:
@@ -238,6 +253,8 @@ class ModelRunner:
                     if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                         module.k_cache = module.v_cache = torch.tensor([])
                         module.k_scale = module.v_scale = torch.tensor([])
+                    if hasattr(module, "_q8_speculative_metadata"):
+                        module._q8_speculative_metadata.clear()
                     release_sequence_state = getattr(module, "release_sequence_state", None)
                     if callable(release_sequence_state):
                         release_sequence_state()
@@ -269,15 +286,15 @@ class ModelRunner:
         except Exception:
             pass
         try:
-            for attr_name in ("graphs", "graph_vars", "graph_bs", "graph_pool", "speculative_graphs", "speculative_graph_vars", "mtp_graph", "mtp_graph_vars", "mtp_draft_graphs", "mtp_draft_graph_vars"):
+            for attr_name in ("graphs", "graph_vars", "graph_bs", "graph_pool", "speculative_graphs", "speculative_graph_vars", "mtp_graph", "mtp_graph_pool", "mtp_graph_vars"):
                 if hasattr(self, attr_name):
                     delattr(self, attr_name)
         except Exception:
             pass
-        try:
-            torch.cuda.synchronize()
-        except Exception:
-            pass
+        # The GGUF CUDA scratch arena is process-global, not owned by this runner.
+        # Releasing it here can invalidate pointers captured by a newer live runner
+        # when this stale runner is reset or finalized later.  It is a single small
+        # reusable allocation and is released automatically when the process exits.
         try:
             torch.cuda.empty_cache()
         except Exception:
@@ -287,12 +304,34 @@ class ModelRunner:
         except Exception:
             pass
         self._logits_bias_cache.clear()
+        self._repetition_token_cache.clear()
         self._speculative_drafts.clear()
         self._speculative_pending.clear()
         self._sampling_generator = None
         self._runtime_signature = None
+        self._model_storage_signature = None
         self._runtime_ready = False
         gc.collect()
+
+    def _get_model_storage_signature(self):
+        signature = []
+        for tensor in (*self.model.parameters(), *self.model.buffers()):
+            getter = getattr(tensor, "get_quantized_subtensors", None)
+            subtensors = getter() if callable(getter) else None
+            tensors = [value for _name, value in (subtensors.items() if isinstance(subtensors, dict) else subtensors or ()) if torch.is_tensor(value)] or [tensor]
+            for value in tensors:
+                signature.append((value.device.type, value.device.index, int(value.data_ptr()), int(value.numel())))
+        return tuple(signature)
+
+    def invalidate_graphs_if_model_storage_changed(self) -> bool:
+        if not self._runtime_ready or self.enforce_eager:
+            return False
+        current_signature = self._get_model_storage_signature()
+        if current_signature == self._model_storage_signature:
+            return False
+        self._note_guard("runtime_reprepare_model_storage_change")
+        self.reset_runtime_state()
+        return True
 
     def _get_graph_capture_signature(self):
         # Note: this only samples the first parameter, so it can miss a partial address
@@ -348,9 +387,8 @@ class ModelRunner:
             entry.pop("speculative_graphs", None)
             entry.pop("speculative_vars", None)
             entry.pop("mtp_graph", None)
+            entry.pop("mtp_pool", None)
             entry.pop("mtp_vars", None)
-            entry.pop("mtp_draft_graphs", None)
-            entry.pop("mtp_draft_vars", None)
         except Exception:
             pass
 
@@ -469,6 +507,7 @@ class ModelRunner:
             pass
         self._release_sample_buffers()
         self._logits_bias_cache.clear()
+        self._repetition_token_cache.clear()
         self._guard_counts.clear()
         self._guard_seen_details.clear()
         if hasattr(self, "sampler"):
@@ -766,32 +805,98 @@ class ModelRunner:
         top_ks = self._to_runtime_device(self._cpu_top_ks[:num_seqs]) if not top_ks_is_zero else None
         top_ps = self._to_runtime_device(self._cpu_top_ps[:num_seqs]) if not top_ps_is_one else None
         min_ps = self._to_runtime_device(self._cpu_min_ps[:num_seqs]) if not min_ps_is_zero else None
-        repetition_penalties = self._to_runtime_device(self._cpu_repetition_penalties[:num_seqs]) if not repetition_penalties_is_one else None
+        repetition_penalties = self._cpu_repetition_penalties[:num_seqs] if not repetition_penalties_is_one else None
         
         return temperatures, cfg_scales, top_ks, top_ps, min_ps, repetition_penalties
 
-    def _apply_speculative_logit_rules(self, seq: Sequence, logits: torch.Tensor, repetition_penalty: float, virtual_tokens: list[int], vocab_size: int | None = None) -> torch.Tensor:
+    def _sync_repetition_token_cache(self, seq: Sequence) -> dict:
+        boundary = int(seq.repetition_penalty_start)
+        completion_count = int(seq.num_tokens) - boundary
+        cache = self._repetition_token_cache.get(seq.seq_id)
+        if cache is None or cache["boundary"] != boundary or cache["synced_tokens"] > completion_count:
+            if cache is None and len(self._repetition_token_cache) >= max(1, int(self.config.max_num_seqs)) * 2:
+                self._repetition_token_cache.pop(next(iter(self._repetition_token_cache)))
+            if cache is None:
+                cache = {"device_states": {}}
+                self._repetition_token_cache[seq.seq_id] = cache
+            cache.update(boundary=boundary, synced_tokens=0, seen=set(), token_ids=[])
+            for state in cache["device_states"].values():
+                state["count"] = 0
+                state["cursor"] = 0
+        new_tokens = seq.token_ids[boundary + cache["synced_tokens"]:boundary + completion_count]
+        full_vocab_size = int(self.config.hf_config.vocab_size)
+        for token_id in new_tokens:
+            token_id = int(token_id)
+            if 0 <= token_id < full_vocab_size and token_id not in cache["seen"]:
+                cache["seen"].add(token_id)
+                cache["token_ids"].append(token_id)
+        cache["synced_tokens"] = completion_count
+        return cache
+
+    @staticmethod
+    def _repetition_virtual_tokens(cache: dict, virtual_tokens, vocab_size: int) -> list[int]:
+        extra_ids = []
+        extra_seen = set()
+        for token_id in virtual_tokens:
+            token_id = int(token_id)
+            if 0 <= token_id < vocab_size and token_id not in cache["seen"] and token_id not in extra_seen:
+                extra_seen.add(token_id)
+                extra_ids.append(token_id)
+        return extra_ids
+
+    def _apply_repetition_penalty(self, seq: Sequence, logits: torch.Tensor, penalty: float, virtual_tokens=()) -> None:
+        if penalty == 1.0:
+            return
+        vocab_size = int(logits.shape[-1])
+        cache = self._sync_repetition_token_cache(seq)
+        virtual_ids = self._repetition_virtual_tokens(cache, virtual_tokens, vocab_size)
+        device_key = (logits.device.type, logits.device.index, vocab_size)
+        state = cache["device_states"].get(device_key)
+        if state is None:
+            capacity = int(self.config.max_model_len) + _REPETITION_INCREMENT_LIMIT
+            state = {
+                "indices": torch.empty(capacity, dtype=torch.long, device=logits.device),
+                "values": torch.empty(capacity, dtype=logits.dtype, device=logits.device),
+                "count": 0,
+                "cursor": 0,
+            }
+            cache["device_states"][device_key] = state
+        new_ids = [token_id for token_id in cache["token_ids"][state["cursor"]:] if token_id < vocab_size]
+        state["cursor"] = len(cache["token_ids"])
+        if len(new_ids) > _REPETITION_INCREMENT_LIMIT:
+            valid_ids = [token_id for token_id in cache["token_ids"] if token_id < vocab_size]
+            state["indices"][:len(valid_ids)].copy_(torch.tensor(valid_ids, dtype=torch.long, device=logits.device))
+            state["count"] = len(valid_ids)
+            new_ids = []
+        apply_sparse_repetition_penalty_(logits, state["indices"], state["count"], new_ids, virtual_ids, penalty, state["values"])
+        state["count"] += len(new_ids)
+
+    @staticmethod
+    def _speculative_logits_processor(seq: Sequence, predictive: bool):
+        processor = seq.logits_processor
+        if predictive and not seq.predictive_penalty and processor is not None and hasattr(processor, "_without_penalty"):
+            processor = processor._without_penalty
+        return processor
+
+    def _apply_speculative_logit_rules(self, seq: Sequence, logits: torch.Tensor, repetition_penalty: float, virtual_tokens: list[int], vocab_size: int | None = None, predictive: bool = False) -> torch.Tensor:
         logits = logits.clone()
-        if vocab_size is not None and seq.logits_processor is not None:
+        logits_processor = self._speculative_logits_processor(seq, predictive)
+        if predictive and not seq.predictive_penalty:
+            repetition_penalty = 1.0
+        if vocab_size is not None and logits_processor is not None:
             expanded_logits = logits.new_full((int(self.config.hf_config.vocab_size),), float("-inf"))
             expanded_logits[:vocab_size].copy_(logits)
             logits = expanded_logits
             vocab_size = None
-        completion_tokens = list(seq.completion_token_ids) + list(virtual_tokens)
-        if repetition_penalty != 1.0 and completion_tokens:
-            token_ids = torch.tensor(completion_tokens, dtype=torch.long, device=logits.device)
-            if vocab_size is not None:
-                token_ids = token_ids[token_ids < vocab_size]
-            scores = logits[token_ids]
-            logits[token_ids] = torch.where(scores < 0, scores * repetition_penalty, scores / repetition_penalty)
+        self._apply_repetition_penalty(seq, logits, repetition_penalty, virtual_tokens)
         bias = self._get_logits_bias(seq, logits.unsqueeze(0))
         if bias is not None:
             if vocab_size is not None:
                 bias = bias[..., :vocab_size]
             self._apply_logits_bias(logits, bias)
-        if seq.logits_processor is not None:
+        if logits_processor is not None:
             input_ids = torch.tensor([seq.token_ids + list(virtual_tokens)], dtype=torch.long, device=logits.device)
-            logits = seq.logits_processor(input_ids, logits.unsqueeze(0).clone())[0]
+            logits = logits_processor(input_ids, logits.unsqueeze(0).clone())[0]
         return logits
 
     def _sample_speculative_target(self, seq: Sequence, logits: torch.Tensor, sample_params, virtual_tokens: list[int]) -> int:
@@ -806,10 +911,10 @@ class ModelRunner:
             seq.logits_processor_update_state(token_id)
         return token_id
 
-    def _speculative_distribution(self, seq: Sequence, logits: torch.Tensor, sample_params, virtual_tokens: list[int], vocab_size: int | None = None) -> torch.Tensor:
+    def _speculative_distribution(self, seq: Sequence, logits: torch.Tensor, sample_params, virtual_tokens: list[int], vocab_size: int | None = None, predictive: bool = False) -> torch.Tensor:
         temperatures, _cfg_scales, _top_ks, _top_ps, _min_ps, repetition_penalties = sample_params
         penalty = 1.0 if repetition_penalties is None else float(repetition_penalties[0].item())
-        logits = self._apply_speculative_logit_rules(seq, logits, penalty, virtual_tokens, vocab_size).float().div_(temperatures[0])
+        logits = self._apply_speculative_logit_rules(seq, logits, penalty, virtual_tokens, vocab_size, predictive=predictive).float().div_(temperatures[0])
         top_k = int(seq.top_k) if seq.top_k is not None and 0 < int(seq.top_k) < logits.numel() else None
         top_p = float(seq.top_p) if seq.top_p is not None and 0.0 < float(seq.top_p) < 1.0 else None
         min_p = float(seq.min_p) if seq.min_p is not None and float(seq.min_p) > 0.0 else None
@@ -928,6 +1033,27 @@ class ModelRunner:
         if pending is not None:
             self._speculative_pending[seq_id] = {name: tensor.to(device=device) for name, tensor in pending.items()}
 
+    def snapshot_speculative_rewind_state(self, seq_id: int) -> dict:
+        pending = self._speculative_pending.get(seq_id)
+        draft = self._speculative_drafts.get(seq_id)
+        return {
+            "mtp_cache_length": self.model.mtp.get_cache_length(),
+            "draft": None if draft is None else {name: tensor.detach().to("cpu").as_subclass(torch.Tensor).clone() for name, tensor in draft.items()},
+            "pending": None if pending is None else {name: tensor.detach().to("cpu").as_subclass(torch.Tensor).clone() for name, tensor in pending.items()},
+        }
+
+    def restore_speculative_rewind_state(self, seq_id: int, snapshot: dict) -> None:
+        self.model.mtp.truncate_cache(int(snapshot["mtp_cache_length"]))
+        self._speculative_drafts.clear()
+        self._speculative_pending.clear()
+        device = self._get_runtime_device()
+        draft = snapshot.get("draft")
+        if draft is not None:
+            self._speculative_drafts[seq_id] = {name: tensor.to(device=device) for name, tensor in draft.items()}
+        pending = snapshot.get("pending")
+        if pending is not None:
+            self._speculative_pending[seq_id] = {name: tensor.to(device=device) for name, tensor in pending.items()}
+
     def _prepare_speculative_verify(self, seq: Sequence, draft_tokens: list[int] | torch.Tensor):
         verify_length = len(draft_tokens) + 1
         current_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
@@ -957,9 +1083,13 @@ class ModelRunner:
         return graph_vars["outputs"], graph_vars["logits"]
 
     def _advance_mtp(self, seq: Sequence, token_ids: list[int], positions: torch.Tensor, hidden_states: torch.Tensor) -> None:
-        mtp_input_ids = torch.tensor(token_ids, dtype=torch.long, device=hidden_states.device).unsqueeze(0)
-        mtp_hidden, mtp_logits = self._run_mtp_forward(mtp_input_ids, positions, hidden_states, last_logits_only=True)
-        self._speculative_drafts[seq.seq_id] = {"logits": mtp_logits[0, -1].clone(), "hidden_states": mtp_hidden[:, -1:].clone()}
+        mtp_hidden = mtp_logits = None
+        for token_index, token_id in enumerate(token_ids):
+            mtp_input_ids = torch.tensor([[token_id]], dtype=torch.long, device=hidden_states.device)
+            mtp_positions = positions[..., token_index:token_index + 1] if positions.ndim == 3 else positions[token_index:token_index + 1]
+            mtp_hidden, mtp_logits = self._run_mtp_forward(mtp_input_ids, mtp_positions, hidden_states[:, token_index:token_index + 1], last_logits_only=True)
+        next_token = self.mtp_graph_vars["next_token"] if getattr(self, "mtp_graph", None) is not None and not self.enforce_eager else torch.argmax(mtp_logits[0, -1]).reshape(1)
+        self._speculative_drafts[seq.seq_id] = {"logits": mtp_logits[0, -1].clone(), "hidden_states": mtp_hidden[:, -1:].clone(), "next_token": next_token.clone()}
 
     def _build_mtp_drafts(self, seq: Sequence, sample_params, draft_count: int, start_position: int) -> tuple[list[int] | torch.Tensor, int, list[torch.Tensor] | None]:
         draft_state = self._speculative_drafts[seq.seq_id]
@@ -967,35 +1097,37 @@ class ModelRunner:
         cache_length = self.model.mtp.get_cache_length()
         rejection_sampling = seq.top_k != 1
         confidence_threshold = 0.0 if rejection_sampling else float(getattr(self.model, "_prompt_enhancer_speculative_confidence", 0.0))
-        graph = getattr(self, "mtp_draft_graphs", {}).get(draft_count)
-        if graph is not None and not rejection_sampling and confidence_threshold <= 0.0 and sample_params[-1] is None and seq.logits_processor is None:
-            graph_vars = self.mtp_draft_graph_vars[draft_count]
-            graph_vars["initial_logits"].copy_(draft_state["logits"])
-            graph_vars["hidden_states"].copy_(draft_state["hidden_states"])
-            graph_vars["positions"].copy_(torch.arange(start_position, start_position + draft_count - 1, dtype=torch.long, device=graph_vars["positions"].device))
-            graph_vars["logits_bias"].zero_()
-            bias = self._get_logits_bias(seq, draft_state["logits"].unsqueeze(0))
+        predictive_processor = self._speculative_logits_processor(seq, predictive=True)
+        predictive_repetition = sample_params[-1] is not None and seq.predictive_penalty
+        if not rejection_sampling and draft_count == 2 and confidence_threshold <= 0.0 and not predictive_repetition and predictive_processor is None:
+            initial_logits = draft_state["logits"]
+            bias = self._get_logits_bias(seq, initial_logits.unsqueeze(0))
             if bias is not None:
-                if draft_vocab_size is not None:
-                    bias = bias[..., :draft_vocab_size]
-                graph_vars["logits_bias"].copy_(bias)
-            self.model.mtp._cache.prepare_append()
-            graph.replay()
-            self.model.mtp._cache.advance(draft_count - 1)
-            return graph_vars["draft_tokens"], cache_length, None
+                initial_logits = initial_logits + (bias[..., :draft_vocab_size] if draft_vocab_size is not None else bias)
+            first_draft = torch.argmax(initial_logits).reshape(1) if bias is not None else draft_state["next_token"]
+            draft_position = torch.tensor([start_position], dtype=torch.long, device=draft_state["hidden_states"].device)
+            _draft_hidden, draft_logits = self._run_mtp_forward(first_draft.view(1, 1), draft_position, draft_state["hidden_states"], last_logits_only=True)
+            if bias is None and getattr(self, "mtp_graph", None) is not None and not self.enforce_eager:
+                second_draft = self.mtp_graph_vars["next_token"]
+            else:
+                second_logits = draft_logits[0, -1]
+                if bias is not None:
+                    second_logits = second_logits + (bias[..., :draft_vocab_size] if draft_vocab_size is not None else bias)
+                second_draft = torch.argmax(second_logits).reshape(1)
+            return torch.cat((first_draft, second_draft)), cache_length, None
         draft_tokens = []
         draft_distributions = [] if rejection_sampling else None
         draft_logits = draft_state["logits"]
         draft_hidden = draft_state["hidden_states"]
         for draft_idx in range(draft_count):
             if rejection_sampling:
-                probabilities = self._speculative_distribution(seq, draft_logits, sample_params, draft_tokens, draft_vocab_size)
+                probabilities = self._speculative_distribution(seq, draft_logits, sample_params, draft_tokens, draft_vocab_size, predictive=True)
                 draft_index = self._sample_distribution(probabilities)
                 draft_distributions.append(probabilities)
             else:
                 repetition_penalties = sample_params[-1]
                 penalty = 1.0 if repetition_penalties is None else float(repetition_penalties[0].item())
-                processed_logits = self._apply_speculative_logit_rules(seq, draft_logits, penalty, draft_tokens, draft_vocab_size)
+                processed_logits = self._apply_speculative_logit_rules(seq, draft_logits, penalty, draft_tokens, draft_vocab_size, predictive=True)
                 top_logit, top_token = torch.max(processed_logits, dim=0)
                 if confidence_threshold > 0.0:
                     confidence = torch.exp(top_logit.float() - torch.logsumexp(processed_logits.float(), dim=0))
@@ -1248,23 +1380,7 @@ class ModelRunner:
                 if repetition_penalties is not None:
                     for i, seq in enumerate(cond_seqs):
                         penalty = repetition_penalties[i].item()
-                        if penalty != 1.0:
-                            # Only penalize completion tokens (not prompt tokens)
-                            completion_tokens = torch.tensor(seq.completion_token_ids, device=logits_cond.device)
-                            if len(completion_tokens) > 0:
-                                # Create token mask: mark tokens that appeared in completion
-                                token_mask = torch.zeros(logits_cond.shape[1], dtype=torch.bool, device=logits_cond.device)
-                                token_mask[completion_tokens] = True
-                                
-                                # Apply standard repetition penalty formula (matching transformers implementation):
-                                # For tokens in completion: if score < 0 then score * penalty, else score / penalty
-                                penalty_scores = torch.where(
-                                    logits_cond[i] < 0,
-                                    logits_cond[i] * penalty,
-                                    logits_cond[i] / penalty
-                                )
-                                # Only apply penalty to tokens that appeared in completion
-                                logits_cond[i] = torch.where(token_mask, penalty_scores, logits_cond[i])
+                        self._apply_repetition_penalty(seq, logits_cond[i], float(penalty))
                 
                 # Apply CFG formula: logits_cfg = logits_uncond + cfg_scale * (logits_cond - logits_uncond)
                 cfg_scales_tensor = cfg_scales.unsqueeze(1)  # [num_cond, 1]
@@ -1333,23 +1449,7 @@ class ModelRunner:
                 if repetition_penalties is not None:
                     for i, seq in enumerate(seqs):
                         penalty = repetition_penalties[i].item()
-                        if penalty != 1.0:
-                            # Only penalize completion tokens (not prompt tokens)
-                            completion_tokens = torch.tensor(seq.completion_token_ids, device=logits.device)
-                            if len(completion_tokens) > 0:
-                                # Create token mask: mark tokens that appeared in completion
-                                token_mask = torch.zeros(logits.shape[1], dtype=torch.bool, device=logits.device)
-                                token_mask[completion_tokens] = True
-                                
-                                # Apply standard repetition penalty formula (matching transformers implementation):
-                                # For tokens in completion: if score < 0 then score * penalty, else score / penalty
-                                penalty_scores = torch.where(
-                                    logits[i] < 0,
-                                    logits[i] * penalty,
-                                    logits[i] / penalty
-                                )
-                                # Only apply penalty to tokens that appeared in completion
-                                logits[i] = torch.where(token_mask, penalty_scores, logits[i])
+                        self._apply_repetition_penalty(seq, logits[i], float(penalty))
                 
                 # Apply logits processor for constrained decoding (if any sequence has one)
                 for i, seq in enumerate(seqs):
@@ -1408,9 +1508,8 @@ class ModelRunner:
                 self.speculative_graphs = cached.get("speculative_graphs", {})
                 self.speculative_graph_vars = cached.get("speculative_vars", {})
                 self.mtp_graph = cached.get("mtp_graph")
+                self.mtp_graph_pool = cached.get("mtp_pool")
                 self.mtp_graph_vars = cached.get("mtp_vars", {})
-                self.mtp_draft_graphs = cached.get("mtp_draft_graphs", {})
-                self.mtp_draft_graph_vars = cached.get("mtp_draft_vars", {})
                 if cache_key in self._graph_cache_order:
                     self._graph_cache_order.remove(cache_key)
                 self._graph_cache_order.append(cache_key)
@@ -1438,6 +1537,14 @@ class ModelRunner:
         self.graphs = {}
         self.graph_pool = self._graph_pool_seed
 
+        try:
+            import llamacpp_gguf_cuda
+            prepare_runtime_buffers = getattr(llamacpp_gguf_cuda, "prepare_runtime_buffers", None)
+            if prepare_runtime_buffers is not None:
+                prepare_runtime_buffers(model_device)
+        except ImportError:
+            pass
+
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
@@ -1461,9 +1568,8 @@ class ModelRunner:
         self.speculative_graphs = {}
         self.speculative_graph_vars = {}
         self.mtp_graph = None
+        self.mtp_graph_pool = None
         self.mtp_graph_vars = {}
-        self.mtp_draft_graphs = {}
-        self.mtp_draft_graph_vars = {}
         if getattr(self.model, "mtp", None) is not None and bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False)):
             dummy_block = config.num_kvcache_blocks - 1
             for verify_length in reversed(range(2, self._MAX_SPECULATIVE_DRAFT_TOKENS + 2)):
@@ -1496,50 +1602,22 @@ class ModelRunner:
             mtp_hidden_states = torch.zeros((1, 1, hf_config.hidden_size), dtype=self.dtype, device=model_device)
             self.model.mtp._cache.cache_seqlens.zero_()
             mtp_outputs, mtp_logits = self.model.mtp(mtp_input_ids, mtp_positions, mtp_hidden_states, last_logits_only=True, cache_prepared=True)
+            mtp_next_token = torch.argmax(mtp_logits[0, -1]).reshape(1)
             mtp_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(mtp_graph, self.graph_pool):
+            with torch.cuda.graph(mtp_graph):
                 mtp_outputs, mtp_logits = self.model.mtp(mtp_input_ids, mtp_positions, mtp_hidden_states, last_logits_only=True, cache_prepared=True)
+                mtp_next_token = torch.argmax(mtp_logits[0, -1]).reshape(1)
             torch.cuda.synchronize()
             self.mtp_graph = mtp_graph
+            self.mtp_graph_pool = mtp_graph.pool()
             self.mtp_graph_vars = {
                 "input_ids": mtp_input_ids,
                 "positions": mtp_positions,
                 "hidden_states": mtp_hidden_states,
                 "outputs": mtp_outputs,
                 "logits": mtp_logits,
+                "next_token": mtp_next_token,
             }
-            for draft_count in range(2, self._MAX_SPECULATIVE_DRAFT_TOKENS + 1):
-                mtp_initial_logits = torch.zeros(getattr(self.model.mtp, "draft_vocab_size", hf_config.vocab_size), dtype=self.dtype, device=model_device)
-                mtp_logits_bias = torch.zeros_like(mtp_initial_logits)
-                mtp_draft_hidden = torch.zeros((1, 1, hf_config.hidden_size), dtype=self.dtype, device=model_device)
-                mtp_draft_positions = torch.arange(draft_count - 1, dtype=torch.int64, device=model_device)
-                mtp_draft_tokens = torch.zeros(draft_count, dtype=torch.int64, device=model_device)
-
-                def run_mtp_draft_chain():
-                    first_draft = torch.argmax(mtp_initial_logits + mtp_logits_bias).reshape(1)
-                    mtp_draft_tokens[:1].copy_(first_draft)
-                    current_hidden = mtp_draft_hidden
-                    for draft_index in range(draft_count - 1):
-                        current_hidden, current_logits = self.model.mtp(mtp_draft_tokens[draft_index:draft_index + 1].view(1, 1), mtp_draft_positions[draft_index:draft_index + 1], current_hidden, last_logits_only=True, cache_prepared=True)
-                        self.model.mtp._cache.cache_seqlens.add_(1)
-                        next_draft = torch.argmax(current_logits[0, -1] + mtp_logits_bias).reshape(1)
-                        mtp_draft_tokens[draft_index + 1:draft_index + 2].copy_(next_draft)
-
-                self.model.mtp._cache.cache_seqlens.zero_()
-                run_mtp_draft_chain()
-                self.model.mtp._cache.cache_seqlens.zero_()
-                draft_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(draft_graph, self.graph_pool):
-                    run_mtp_draft_chain()
-                torch.cuda.synchronize()
-                self.mtp_draft_graphs[draft_count] = draft_graph
-                self.mtp_draft_graph_vars[draft_count] = {
-                    "initial_logits": mtp_initial_logits,
-                    "logits_bias": mtp_logits_bias,
-                    "hidden_states": mtp_draft_hidden,
-                    "positions": mtp_draft_positions,
-                    "draft_tokens": mtp_draft_tokens,
-                }
             self.model.mtp._cache.cache_seqlens.zero_()
         self._graph_cache[cache_key] = {
             "graphs": self.graphs,
@@ -1549,9 +1627,8 @@ class ModelRunner:
             "speculative_graphs": self.speculative_graphs,
             "speculative_vars": self.speculative_graph_vars,
             "mtp_graph": self.mtp_graph,
+            "mtp_pool": self.mtp_graph_pool,
             "mtp_vars": self.mtp_graph_vars,
-            "mtp_draft_graphs": self.mtp_draft_graphs,
-            "mtp_draft_vars": self.mtp_draft_graph_vars,
             "sig": self._get_graph_capture_signature(),
         }
         if cache_key in self._graph_cache_order:
@@ -1560,3 +1637,4 @@ class ModelRunner:
         while len(self._graph_cache_order) > 5:
             old_key = self._graph_cache_order.pop(0)
             self._drop_graph_cache_entry(old_key)
+        self._model_storage_signature = self._get_model_storage_signature()

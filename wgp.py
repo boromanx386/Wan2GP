@@ -44,7 +44,7 @@ from pathlib import Path
 from datetime import datetime
 import gradio as gr
 from shared.gradio import downloads as gradio_downloads
-from shared.gradio import gradio_model_switch_patch, gradio_queue_focus_patch, video_preview
+from shared.gradio import gradio_model_switch_patch, gradio_queue_focus_patch, gradio_startup_patch, video_preview
 from gradio.themes.utils.sizes import Size
 import random
 import json
@@ -154,7 +154,7 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.14"
-WanGP_version = "12.644"
+WanGP_version = "12.648"
 settings_version = 2.77
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -1076,6 +1076,7 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
         return err(custom_settings_error)
     inputs["custom_settings"] = parsed_custom_settings
     clear_custom_setting_slots(inputs)
+    inputs["guidance_phases"], inputs["video_prompt_type"] = normalize_phase_2_tiling_selection(model_def, inputs["guidance_phases"], inputs["video_prompt_type"])
     extra_settings_error = extra_settings.validate_inputs(inputs, model_def, get_max_frames=get_max_frames)
     if len(extra_settings_error) > 0:
         return err(extra_settings_error)
@@ -1131,9 +1132,6 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
     loras_multipliers = inputs["loras_multipliers"]
     activated_loras = inputs["activated_loras"]
     guidance_phases= inputs["guidance_phases"]
-    guidance_phases, video_prompt_type = normalize_phase_2_tiling_selection(model_def, guidance_phases, video_prompt_type)
-    inputs["guidance_phases"] = guidance_phases
-    inputs["video_prompt_type"] = video_prompt_type
     model_switch_phase = inputs["model_switch_phase"]    
     switch_threshold = inputs["switch_threshold"]
     switch_threshold2 = inputs["switch_threshold2"]
@@ -2114,7 +2112,11 @@ def load_queue_action(filepath, state, evt:gr.EventData):
             newly_loaded_queue = [ {"id": 0, "params": newly_loaded_queue}]
         else:
             inline_queue_source = newly_loaded_queue
-        newly_loaded_queue, error = _parse_task_manifest(newly_loaded_queue, state, None, None, "[unpack queue]", verbose_output = verbose_output )
+        try:
+            newly_loaded_queue, error = _parse_task_manifest(newly_loaded_queue, state, None, None, "[unpack queue]", verbose_output = verbose_output )
+        except Exception as exception:
+            traceback.print_exc()
+            newly_loaded_queue, error = [], f"Inline queue validation failed: {exception}"
         if error:
             if isinstance(inline_queue_source, dict):
                 inline_queue_source = [{"id": 0, "params": inline_queue_source}]
@@ -2661,6 +2663,7 @@ server_config.setdefault(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY,
 gradio_queue_focus_patch.BACKGROUND_SCHEDULER_DEFAULT_ENABLED = bool(server_config.get(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1))
 gradio_queue_focus_patch.install()
 gradio_model_switch_patch.install(verbose=ui_perf_debug)
+gradio_startup_patch.install()
 
 checkpoints_paths = server_config.get("checkpoints_paths", None)
 if checkpoints_paths is None: checkpoints_paths = server_config["checkpoints_paths"] = fl.default_checkpoints_paths
@@ -3174,8 +3177,9 @@ def fix_settings(model_type, ui_defaults, min_settings_version = 0):
 
     model_handler = get_model_handler(base_model_type)
     if hasattr(model_handler, "fix_settings"):
-            model_handler.fix_settings(base_model_type, settings_version, model_def, ui_defaults)
-    apply_custom_settings_defaults(model_def, ui_defaults)
+        model_handler.fix_settings(base_model_type, settings_version, model_def, ui_defaults)
+
+    ui_defaults["settings_version"] = settings_version
 
 def get_default_prompt(i2v):
     if i2v:
@@ -3188,6 +3192,7 @@ def get_factory_settings(model_type):
     model_def = get_model_def(model_type)
     base_model_type = get_base_model_type(model_type)
     ui_defaults = copy.deepcopy(primary_settings)
+    apply_custom_settings_defaults(model_def, ui_defaults)
     ui_defaults.update({
         "settings_version": settings_version,
         "prompt": get_default_prompt(i2v),
@@ -3200,7 +3205,8 @@ def get_factory_settings(model_type):
         ui_defaults.update(copy.deepcopy(model_settings))
     if len(ui_defaults.get("prompt", "")) == 0:
         ui_defaults["prompt"] = get_default_prompt(i2v)
-    fix_settings(model_type, ui_defaults, settings_version)
+    # needs to implement settings md version for defaults/finetunes
+    # fix_settings(model_type, ui_defaults, settings_version)
     return ui_defaults
 
 
@@ -4985,7 +4991,7 @@ def select_media(state, current_gallery_tab, input_file_list, file_selected, aud
             video_loras_multipliers += [""] * len(video_activated_loras)
             lora_dir = None if video_model_type is None else get_lora_dir(video_model_type)
             video_activated_loras = [ f"<span class='copy-swap' tabindex=0><SPAN class='copy-swap__trunc' >{get_lora_local_path(None, lora)}</span><span class='copy-swap__full'>{get_lora_URL(lora_dir, lora) .split('|')[0]}</span></span>" for lora in video_activated_loras] 
-            video_activated_loras = [ f"<TR><TD style='padding-top:0px;padding-left:0px;width:100%;max-width:0'>{lora}</TD><TD style='width:1%;white-space:nowrap;vertical-align:top'>x{multiplier if len(multiplier)>0 else '1'}</TD></TR>" for lora, multiplier in zip(video_activated_loras, video_loras_multipliers) ]
+            video_activated_loras = [ f"<TR><TD style='padding-top:0px;padding-left:0px;width:100%;max-width:0'>{lora}</TD><TD style='width:1%;white-space:nowrap;vertical-align:top'>x{str(multiplier).strip() or '1'}</TD></TR>" for lora, multiplier in zip(video_activated_loras, video_loras_multipliers) ]
             video_activated_loras_str = "<TABLE style='border:0px;padding:0px;width:100%;table-layout:fixed'>" + "".join(video_activated_loras) + "</TABLE>" if len(video_activated_loras) > 0 else ""
             video_duration_seconds = configs.get("duration_seconds", 0)
             if model_def.get("duration_slider", None) is not None and video_duration_seconds > 0:
@@ -5086,6 +5092,8 @@ def select_media(state, current_gallery_tab, input_file_list, file_selected, aud
             if isinstance(video_custom_settings, dict):
                 custom_settings = get_model_custom_settings(model_def)
                 for idx, setting_def in enumerate(custom_settings):
+                    if not custom_setting_visible(setting_def, video_video_prompt_type, video_audio_prompt_type):
+                        continue
                     setting_id = setting_def.get("id", get_custom_setting_id(setting_def, idx))
                     setting_value = video_custom_settings.get(setting_id, None)
                     if setting_value is None:
@@ -5955,7 +5963,8 @@ def edit_media(
 
     if mode == "edit_postprocessing":
         if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 or film_grain_intensity > 0:
-            send_cmd("progress", [0, get_latest_status(state,"Upsampling - Starting" if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 else "Adding Film Grain"  )])
+            spatial_status = upsampler_api.method_progress_label(spatial_upsampling)
+            send_cmd("progress", [0, get_latest_status(state, spatial_status if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 else "Adding Film Grain")])
             if source_is_image:
                 sample = torch.from_numpy(np.array(image).astype(np.uint8)).unsqueeze(0).permute(-1,0,1,2)
             else:
@@ -5972,7 +5981,7 @@ def edit_media(
 
         if len(spatial_upsampling) > 0:
             def flashvsr_progress(phase, current_step=None, total_steps=None):
-                phase_text = f"Upsampling - {phase}"
+                phase_text = str(phase)
                 gen["progress_phase"] = (phase_text, int(current_step) if current_step is not None else -1)
                 status_msg = get_latest_status(state, phase_text)
                 if current_step is not None and total_steps is not None and int(total_steps) > 0:
@@ -8144,7 +8153,8 @@ def generate_media(
 
 
                 if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 and (not upsampler_api.is_vae_upsampling(spatial_upsampling) or upsampler_api.has_post_model_process_vae_upsampling(spatial_upsampling)):
-                    send_cmd("progress", [0, get_latest_status(state,"Upsampling - Starting")])
+                    spatial_status = upsampler_api.method_progress_label(spatial_upsampling)
+                    send_cmd("progress", [0, merge_status_context(status, spatial_status)])
                 
                 output_fps  = fps
                 if len(temporal_upsampling) > 0:
@@ -8152,9 +8162,9 @@ def generate_media(
 
                 if len(spatial_upsampling) > 0:
                     def flashvsr_progress(phase, current_step=None, total_steps=None):
-                        phase_text = f"Upsampling - {phase}"
+                        phase_text = str(phase)
                         gen["progress_phase"] = (phase_text, int(current_step) if current_step is not None else -1)
-                        status_msg = get_latest_status(state, phase_text)
+                        status_msg = merge_status_context(status, phase_text)
                         if current_step is not None and total_steps is not None and int(total_steps) > 0:
                             send_cmd("progress", [(int(current_step), int(total_steps)), status_msg, int(total_steps)])
                         else:
@@ -12120,7 +12130,8 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                             if sample_solver_choices is None:
                                 sample_solver = gr.Dropdown( value="",  choices=[ ("", ""), ], visible= False, label= "Sampler Solver / Scheduler" )
                             else:
-                                sample_solver = gr.Dropdown( value=ui_get("sample_solver", sample_solver_choices[0][1]), 
+                                sample_solver_value = ui_defaults["sample_solver"] = get_default_value(sample_solver_choices, ui_get("sample_solver"), sample_solver_choices[0][1])
+                                sample_solver = gr.Dropdown( value=sample_solver_value,
                                     choices= sample_solver_choices, visible= True, label= "Sampler Solver / Scheduler"
                                 )
                             flow_shift = setting_slider("flow_shift") 

@@ -11,14 +11,14 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 | Modality | Supported models |
 | --- | --- |
-| **Video** | **Wan 2.1/2.2** and derived models, **MiniMax H3**, **LTX-2**, **Hunyuan Video 1/1.5**, **LongCat**, **Kandinsky**, **LTXV**, **MagiHuman** |
-| **Image** | **Qwen Image**, **Z-Image**, **Flux 1/2** (Klein, Chroma), **HiDream** |
-| **Audio / TTS** | **Qwen3 TTS**, **Ace Step 1/2/XL**, **Omnivoice**, **Index TTS2**, **KugelAudio**, **HearMula**, **Chatterbox** |
+| **Video** | **Wan 2.1/2.2** and derived models, **MiniMax H3**, **LTX-2/2.3/2.5**, **Hunyuan Video 1/1.5**, **LongCat**, **Kandinsky**, **LTXV**, **MagiHuman** |
+| **Image** | **Krea 2**, **Qwen Image**, **Z-Image**, **Flux 1/2** (*Klein*, Chroma), **SenseNova**, **Ideogram 4**, **HiDream** |
+| **Audio / TTS** | **Qwen3 TTS**, **Ace Step 1/2/XL**, **Omnivoice**, **Index TTS2/2.5**, **KugelAudio**, **HeartMula**, **Chatterbox**, **Minimax Music**, **Stable Audio 3** |
 
 ### Run More Models on More Hardware
 
 - **Low VRAM requirements**: run select models with as little as **6 GB of VRAM**.
-- **Older Nvidia GPU support**: use RTX 10XX, 20XX, and newer cards.
+- **Older Nvidia GPU support**: use GTX 10XX, RTX 20XX, and newer cards.
 - **AMD GPU support**: run on RDNA 4, 3, 3.5, and 2 hardware; see the Installation section below.
 - **Fast latest-GPU performance**: take advantage of modern GPU acceleration.
 - **Full web interface**: generate, manage, and reuse outputs from an easy browser UI.
@@ -69,6 +69,8 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 - **H3 Face Refiner**: detect, identity-track, and refine up to five faces with H3 Ref2VA without changing the video resolution. Select *H3 Face Refiner* under *Advanced Mode / Post Processing*, use the selected Gallery video's *Post Processing* tab for Late Post Processing, or ask Deepy. Set *Faces to Refine* to `0` for automatic selection of up to five relevant faces.
 
+- **H3 PDD LoRA Acceleration** (new WanGP 12.645): new 8-step acceleration variants are available for FL2VA and Ref2VA. This is not a mere *LoRA Accelerator*, each sequential model evaluation combines four learned denoising-interval outputs, so it why I had to create new model variants to handle this particular LoRA accelerator. Before you ask, yes when using PDD you are stuck to 8 steps and to the Euler Scheduler. 
+
 - **Sense Nova U1.5**: *SenseNova-U1.5 8B MoT* is a unified image generator and editor designed for native-4K images, text-heavy layouts, and infographics. Select it from the Image model list and generate from text or one or more *Reference Images*. Its built-in *Infographic Prompt* enhancer can expand a short brief into a structured layout; native 4K can be still be generated with 8-9GB of RAM and will produce the best infographics. SenseNova comes with a 8 steps *LoRA Accelerator Profile*. Generation can be further accelerated at the cost of some VRAM by enabling the *KV Cache*.
 
 - **New H3 Grouped Row Denoising Mode for Inpainting**: available for both FL2VA & Ref2VA can be used for *Inpainting* in a *Masked Area*
@@ -82,7 +84,8 @@ WanGP is a one-stop super app for the best open source generative models across 
 - **Remote Notifications**: (WanGP 12.643) you can now define *Apprise Destinations* in the *Config / Notification* tab and receives Queue or Deepy related notifications in WhatsApp, Discord, Ntfyn .... The easiest way is to use the *ntfy.sh* service. For instance, just open in your Web Browser https://ntfy.sh/my_unique_sequence and then enter in Apprise Destination *ntfys://my_unique_sequence*
 
 *WanGP 12.643*: Even More Deepy Capabilities, Remote Notifications\
-*WanGP 12.644*: Masked Denoising Grouped Row
+*WanGP 12.644*: Masked Denoising Grouped Row\
+*WanGP 12.645*: H3 PDD LoRA Acceleration
 ## 19th of August 2026: WanGP v12.61, Remember to be nice with Deepy
 
 Deepy and the WanGP Prompt Enhancer have learned some impressive new tricks (enable them from the *Configuration / Deepy* menu):
@@ -457,6 +460,8 @@ conda activate wan2gp
 pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
 ```
+
+For optimized attention, install **SageAttention 1.0.6 on RTX 20XX** and **SageAttention 2.2.0 on RTX 30XX or newer**. SageAttention 2 requires an Ampere-or-newer GPU; GTX 10XX should use SDPA. See the **[Installation Guide](docs/INSTALLATION.md#sage-attention)** for the platform-specific commands.
 
 ### Manual installation: (for GTX 10xx)
 
